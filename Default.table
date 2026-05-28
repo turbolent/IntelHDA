@@ -1,0 +1,10 @@
+"Title" = "IntelHDA";
+"Family" = "Audio";
+"Location" = "";
+"Bus Type" = "PCI";
+"Auto Detect IDs" = "0x26688086 0x1c208086";
+"Instance" = "0";
+"Driver Name" = "IntelHDADriver";
+"Share IRQ Levels" = "Yes";
+"Version" = "0.14";
+"Driver Version" = "0.14";

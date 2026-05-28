@@ -1,0 +1,7 @@
+IntelHDA
+========
+
+Minimal Intel High Definition Audio driver for OPENSTEP.
+
+The goal is simple playback, not a full HDA stack. The current driver is
+focused on one controller, one codec, one analog output path, and PCM playback.
