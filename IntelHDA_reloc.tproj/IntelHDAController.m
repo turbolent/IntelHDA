@@ -130,7 +130,6 @@ struct hda_rate_info {
 
 static const struct hda_rate_info hdaRateTable[] = {
     {8000, 0x0001, HDA_FMT_RATE(HDA_FMT_BASE_48K, 1, 6)},
-    {11025, 0x0002, HDA_FMT_RATE(HDA_FMT_BASE_44K, 1, 4)},
     {16000, 0x0004, HDA_FMT_RATE(HDA_FMT_BASE_48K, 1, 3)},
     {22050, 0x0008, HDA_FMT_RATE(HDA_FMT_BASE_44K, 1, 2)},
     {32000, 0x0010, HDA_FMT_RATE(HDA_FMT_BASE_48K, 2, 3)},
@@ -1029,16 +1028,15 @@ void hdaGetSupportedRates(struct hda_state *s, int *rates,
                           unsigned int *numRates) {
     if (rates != NULL) {
         rates[0] = 8000;
-        rates[1] = 11025;
-        rates[2] = 16000;
-        rates[3] = 22050;
-        rates[4] = 32000;
-        rates[5] = 44100;
-        rates[6] = 48000;
+        rates[1] = 16000;
+        rates[2] = 22050;
+        rates[3] = 32000;
+        rates[4] = 44100;
+        rates[5] = 48000;
     }
 
     if (numRates != NULL)
-        *numRates = 7;
+        *numRates = 6;
 }
 
 unsigned int hdaDefaultFormat(struct hda_state *s) {

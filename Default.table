@@ -6,5 +6,5 @@
 "Instance" = "0";
 "Driver Name" = "IntelHDADriver";
 "Share IRQ Levels" = "Yes";
-"Version" = "0.14";
-"Driver Version" = "0.14";
+"Version" = "0.16";
+"Driver Version" = "0.16";

@@ -309,16 +309,14 @@ static void enablePCHSnoop(id deviceDescription, unsigned short deviceID) {
               channels, rate, (unsigned int)buffer, gHDA->dmaBufferSize,
               bufferSize));
 
-    if (encoding == NX_SoundStreamDataEncoding_Linear8)
-        bits = 8;
-    else if (encoding == NX_SoundStreamDataEncoding_Linear16)
+    if (encoding == NX_SoundStreamDataEncoding_Linear16)
         bits = 16;
     else
         bits = 0;
 
     if (bits == 0) {
         IOLog("%s: rejecting playback request: unsupported encoding %s(%d), "
-              "only linear8/linear16 are enabled\n",
+              "only linear16 is enabled\n",
               DRV_TITLE, encodingName(encoding), encoding);
         return NO;
     }
@@ -437,7 +435,6 @@ static void hdaInterrupt(void *identity, void *state, unsigned int arg) {
 
     count = 0;
     encodings[count++] = NX_SoundStreamDataEncoding_Linear16;
-    encodings[count++] = NX_SoundStreamDataEncoding_Linear8;
     *numEncodings = count;
 }
 

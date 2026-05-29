@@ -2,8 +2,8 @@
 #import <driverkit/i386/ioPorts.h>
 
 #define DRV_TITLE     "IntelHDA"
-#define DRV_VERSION   "v0.14"
-#define DRV_MILESTONE "quiet-default-logging"
+#define DRV_VERSION   "v0.16"
+#define DRV_MILESTONE "disable-11025-rate"
 
 #ifndef HDA_VERBOSE_LOGS
 #define HDA_VERBOSE_LOGS 0
