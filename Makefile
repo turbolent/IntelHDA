@@ -9,11 +9,9 @@ LANGUAGE = English
 
 LOCAL_RESOURCES = Localizable.strings
 
-GLOBAL_RESOURCES = Default.table
+GLOBAL_RESOURCES = Default.table IntelHDA_reloc intelhda-status
 
 CFILES = IntelHDA_bundle_stub.c
-
-TOOLS = IntelHDA_reloc.tproj
 
 OTHERSRCS = Makefile.preamble Makefile Makefile.postamble
 
@@ -30,3 +28,36 @@ include $(MAKEFILEDIR)/$(MAKEFILE)
 -include Makefile.postamble
 
 -include Makefile.dependencies
+
+intelhda-status: tools/intelhda-status.m \
+		IntelHDA_reloc.tproj/IntelHDAStats.h
+	$(CC) -O2 -Wall -ObjC -IIntelHDA_reloc.tproj \
+		-o $@ tools/intelhda-status.m -lDriver
+
+RELOC_SOURCES = IntelHDA_reloc.tproj/IntelHDAController.m \
+	IntelHDA_reloc.tproj/IntelHDADriver.m \
+	IntelHDA_reloc.tproj/IntelHDAMSIPCI.c \
+	IntelHDA_reloc.tproj/IntelHDAMSIWork.c \
+	IntelHDA_reloc.tproj/IntelHDAInterruptCore.c \
+	IntelHDA_reloc.tproj/IntelHDAPlaybackCore.c \
+	IntelHDA_reloc.tproj/IntelHDAController.h \
+	IntelHDA_reloc.tproj/IntelHDADriver.h \
+	IntelHDA_reloc.tproj/IntelHDAMSIPCI.h \
+	IntelHDA_reloc.tproj/IntelHDAMSIWork.h \
+	IntelHDA_reloc.tproj/IntelHDAInterruptCore.h \
+	IntelHDA_reloc.tproj/IntelHDAPlaybackCore.h \
+	IntelHDA_reloc.tproj/IntelHDAStats.h \
+	IntelHDA_reloc.tproj/PCIMSI/PCIMSIClient.h \
+	IntelHDA_reloc.tproj/PCIMSI/PCIMSICore.h \
+	IntelHDA_reloc.tproj/Makefile \
+	IntelHDA_reloc.tproj/Makefile.preamble
+
+IntelHDA_reloc: $(RELOC_SOURCES)
+	cd IntelHDA_reloc.tproj && /bin/make all
+	cp IntelHDA_reloc.tproj/IntelHDA_reloc $@
+
+clean:: clean_reloc
+
+clean_reloc:
+	-cd IntelHDA_reloc.tproj && $(MAKE) clean
+	-/bin/rm -f IntelHDA_reloc

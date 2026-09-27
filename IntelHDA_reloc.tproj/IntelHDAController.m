@@ -5,6 +5,7 @@
 
 #import "IntelHDAController.h"
 #import "IntelHDADriver.h"
+#import "IntelHDAPlaybackCore.h"
 
 #define HDA_REG_GCAP      0x00
 #define HDA_REG_VMIN      0x02
@@ -14,6 +15,7 @@
 #define HDA_REG_STATESTS  0x0e
 #define HDA_REG_INTCTL    0x20
 #define HDA_REG_INTSTS    0x24
+#define HDA_REG_WALLCLK   0x30
 #define HDA_REG_CORBLBASE 0x40
 #define HDA_REG_CORBUBASE 0x44
 #define HDA_REG_CORBWP    0x48
@@ -33,6 +35,7 @@
 #define HDA_INT_GLOBAL  0x80000000
 #define HDA_CORBCTL_RUN 0x02
 #define HDA_RIRBCTL_RUN 0x02
+#define HDA_RIRBCTL_RESPONSE_STATUS 0x01
 
 #define HDA_SD_CTL       0x00
 #define HDA_SD_STS       0x03
@@ -55,6 +58,7 @@
 #define HDA_VERB_GET_CONN_SELECT    0xf01
 #define HDA_VERB_GET_CONN_ENTRY     0xf02
 #define HDA_VERB_GET_PIN_CONTROL    0xf07
+#define HDA_VERB_GET_PIN_SENSE      0xf09
 #define HDA_VERB_GET_AMP_GAIN_MUTE  0x0b00
 #define HDA_VERB_SET_STREAM_FORMAT  0x200
 #define HDA_VERB_SET_AMP_GAIN_MUTE  0x300
@@ -87,9 +91,11 @@
 #define HDA_AMPCAP_MUTE           0x80000000
 #define HDA_PINCAP_HEADPHONE      0x00000008
 #define HDA_PINCAP_OUTPUT         0x00000010
+#define HDA_PINCAP_PRESENCE       0x00000004
 #define HDA_PINCAP_EAPD           0x00010000
 #define HDA_PINCTL_OUT_ENABLE     0x40
 #define HDA_PINCTL_HP_ENABLE      0x80
+#define HDA_PIN_SENSE_PRESENCE    0x80000000
 
 #define HDA_SUPPCM_BITS_8  0x00010000
 #define HDA_SUPPCM_BITS_16 0x00020000
@@ -598,6 +604,8 @@ static int hdaAnalogOutputPinInfo(struct hda_state *s, unsigned int nid,
     unsigned int defcfg;
     unsigned int portConn;
     unsigned int dev;
+    unsigned int pinSense;
+    int present;
     int rank;
 
     if (hdaGetParam(s, nid, HDA_PARAM_AUDIO_WIDGET_CAPS, &caps))
@@ -616,6 +624,18 @@ static int hdaAnalogOutputPinInfo(struct hda_state *s, unsigned int nid,
     portConn = HDA_DEFCFG_PORT_CONN(defcfg);
     dev = HDA_DEFCFG_DEVICE(defcfg);
     rank = hdaOutputPinRank(defcfg);
+    present = -1;
+
+    if (pinCaps & HDA_PINCAP_PRESENCE) {
+        present = 0;
+        if (hdaCodecCommand(s, nid, HDA_VERB_GET_PIN_SENSE, 0, &pinSense) ==
+                0 &&
+            (pinSense & HDA_PIN_SENSE_PRESENCE))
+            present = 1;
+    }
+
+    if (dev == HDA_JACK_HP_OUT && present == 1)
+        rank = 0;
 
     if (portConn == 1) {
         IOLog("%s: reject output pin nid 0x%x defcfg 0x%08x device %s port "
@@ -631,10 +651,11 @@ static int hdaAnalogOutputPinInfo(struct hda_state *s, unsigned int nid,
         return 0;
     }
 
-    IOLog("%s: candidate analog output pin nid 0x%x rank %d device %s pincap "
-          "0x%08x defcfg 0x%08x assoc %d seq %d color 0x%x loc 0x%x\n",
-          DRV_TITLE, nid, rank, hdaDefaultDeviceName(dev), pinCaps, defcfg,
-          HDA_DEFCFG_ASSOC(defcfg), HDA_DEFCFG_SEQUENCE(defcfg),
+    IOLog("%s: candidate analog output pin nid 0x%x rank %d device %s "
+          "present %d pincap 0x%08x defcfg 0x%08x assoc %d seq %d color "
+          "0x%x loc 0x%x\n",
+          DRV_TITLE, nid, rank, hdaDefaultDeviceName(dev), present, pinCaps,
+          defcfg, HDA_DEFCFG_ASSOC(defcfg), HDA_DEFCFG_SEQUENCE(defcfg),
           HDA_DEFCFG_COLOR(defcfg), HDA_DEFCFG_LOCATION(defcfg));
 
     if (rankOut != NULL)
@@ -718,6 +739,7 @@ static int hdaSetupPath(struct hda_state *s) {
 
         if (pinCount < 32 && hdaAnalogOutputPinInfo(s, nid, &pinRank[pinCount],
                                                     &pinDefcfg[pinCount])) {
+            (void)hdaCodecCommand(s, nid, HDA_VERB_SET_PIN_CONTROL, 0, NULL);
             pinList[pinCount++] = nid;
         }
     }
@@ -867,7 +889,6 @@ static void hdaProgramPath(struct hda_state *s, unsigned int format) {
     }
 
     (void)hdaCodecCommand(s, s->pin, HDA_VERB_SET_PIN_CONTROL, pinCtl, NULL);
-    hdaSetOutputVolume(s, NO, 0, 0);
 }
 
 static int hdaSetupRings(struct hda_state *s) {
@@ -925,7 +946,11 @@ static int hdaSetupRings(struct hda_state *s) {
     hdaWrite8(s, HDA_REG_RIRBSTS, 0x05);
     s->rirbRp = hdaRead16(s, HDA_REG_RIRBWP) & (s->rirbEntries - 1);
 
-    hdaWrite8(s, HDA_REG_RIRBCTL, HDA_RIRBCTL_RUN);
+    /* Keep response status generation enabled so each polled response can
+     * be acknowledged. QEMU stops CORB at RINTCNT until that status clears.
+     * INTCTL.CIE remains clear, so codec responses never deliver an IRQ. */
+    hdaWrite8(s, HDA_REG_RIRBCTL,
+              HDA_RIRBCTL_RUN | HDA_RIRBCTL_RESPONSE_STATUS);
     hdaWrite8(s, HDA_REG_CORBCTL, HDA_CORBCTL_RUN);
 
     IOLog("%s: CORB %d entries phys 0x%08x RIRB %d entries phys 0x%08x\n",
@@ -963,31 +988,7 @@ static int hdaSelectCodecAddress(struct hda_state *s, unsigned int statests) {
 
 unsigned int hdaFormatForParams(unsigned int rate, unsigned int bits,
                                 unsigned int channels) {
-    unsigned int i;
-    unsigned int fmt;
-
-    if (channels == 0 || channels > 16)
-        return 0;
-
-    fmt = 0;
-    for (i = 0; hdaRateTable[i].rate != 0; i++) {
-        if (hdaRateTable[i].rate == rate) {
-            fmt = hdaRateTable[i].format;
-            break;
-        }
-    }
-    if (fmt == 0 && rate != 48000)
-        return 0;
-
-    if (bits == 8)
-        fmt |= HDA_FMT_BITS_8;
-    else if (bits == 16)
-        fmt |= HDA_FMT_BITS_16;
-    else
-        return 0;
-
-    fmt |= (channels - 1);
-    return fmt;
+    return IntelHDAPlaybackFormat(rate, bits, channels);
 }
 
 int hdaRateIsSupported(struct hda_state *s, unsigned int rate) {
@@ -1026,17 +1027,13 @@ int hdaBitsAreKnown(unsigned int bits) { return (bits == 8 || bits == 16); }
 
 void hdaGetSupportedRates(struct hda_state *s, int *rates,
                           unsigned int *numRates) {
-    if (rates != NULL) {
-        rates[0] = 8000;
-        rates[1] = 16000;
-        rates[2] = 22050;
-        rates[3] = 32000;
-        rates[4] = 44100;
-        rates[5] = 48000;
-    }
-
-    if (numRates != NULL)
-        *numRates = 6;
+    unsigned i;
+    /* Preserve the established IOAudio formats, including ALC889 22050 Hz
+     * even when its codec capability bitmap does not advertise that rate. */
+    (void)s;
+    for (i = 0; i < 6; i++)
+        if (rates) rates[i] = hdaRateTable[i].rate;
+    if (numRates) *numRates = 6;
 }
 
 unsigned int hdaDefaultFormat(struct hda_state *s) {
@@ -1119,6 +1116,7 @@ int hdaInitController(struct hda_state *s) {
 
     s->initialized = YES;
     hdaProgramPath(s, hdaDefaultFormat(s));
+    hdaSetOutputVolume(s, YES, 0, 0);
     IOLog("%s: initialized codec path pin 0x%x DAC 0x%x\n", DRV_TITLE, s->pin,
           s->dac);
     return 0;
@@ -1129,10 +1127,11 @@ void hdaShutdownController(struct hda_state *s) {
         return;
 
     if (s->regs != NULL) {
-        hdaStopOutput(s);
+        if (s->outputStreamBase >= 0x80 && !hdaStopOutput(s)) return;
         hdaWrite32(s, HDA_REG_INTCTL, 0);
         hdaWrite8(s, HDA_REG_CORBCTL, 0);
         hdaWrite8(s, HDA_REG_RIRBCTL, 0);
+        if (hdaRead8(s, HDA_REG_CORBCTL) || hdaRead8(s, HDA_REG_RIRBCTL)) return;
     }
 
     hdaFreeDMA(&s->bdl);
@@ -1141,37 +1140,17 @@ void hdaShutdownController(struct hda_state *s) {
     s->initialized = NO;
 }
 
-static void hdaResetStream(struct hda_state *s) {
-    unsigned int base;
-    unsigned int ctl;
-    int i;
-
-    base = s->outputStreamBase;
-    ctl = hdaReadStreamControl(s, base);
-    ctl &= ~HDA_SD_CTL_RUN;
-    hdaWriteStreamControl(s, base, ctl);
-    for (i = 0; i < HDA_POLL_COUNT; i++) {
-        if ((hdaReadStreamControl(s, base) & HDA_SD_CTL_RUN) == 0)
-            break;
-        IODelay(10);
-    }
-
-    hdaWriteStreamControl(s, base,
-                          hdaReadStreamControl(s, base) | HDA_SD_CTL_SRST);
-    for (i = 0; i < HDA_POLL_COUNT; i++) {
-        if (hdaReadStreamControl(s, base) & HDA_SD_CTL_SRST)
-            break;
-        IODelay(10);
-    }
-    hdaWriteStreamControl(s, base,
-                          hdaReadStreamControl(s, base) & ~HDA_SD_CTL_SRST);
-    for (i = 0; i < HDA_POLL_COUNT; i++) {
-        if ((hdaReadStreamControl(s, base) & HDA_SD_CTL_SRST) == 0)
-            break;
-        IODelay(10);
-    }
-    hdaWrite8(s, base + HDA_SD_STS,
-              HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE);
+static IntelHDARegisterOps hdaRegisterOps(struct hda_state *s);
+static void hdaStreamDelay(void *context) { (void)context; IODelay(10); }
+static int hdaResetStream(struct hda_state *s) {
+    IntelHDARegisterOps ops = hdaRegisterOps(s);
+    int ok = IntelHDAResetStream(&ops, s->outputStreamBase,
+                                HDA_POLL_COUNT, hdaStreamDelay);
+    if (!ok)
+        IOLog("%s: stream reset failed at 0x%x control 0x%06x\n",
+              DRV_TITLE, s->outputStreamBase,
+              hdaReadStreamControl(s, s->outputStreamBase));
+    return ok;
 }
 
 static int hdaSetupOutputBDL(struct hda_state *s, unsigned int bytes,
@@ -1198,7 +1177,6 @@ static int hdaSetupOutputBDL(struct hda_state *s, unsigned int bytes,
     while (remain > 0) {
         unsigned int phys;
         unsigned int chunk;
-        unsigned int pageRemain;
         unsigned int ioc;
 
         if (entries >= HDA_BDL_ENTRIES) {
@@ -1220,21 +1198,13 @@ static int hdaSetupOutputBDL(struct hda_state *s, unsigned int bytes,
             return -1;
         }
 
-        pageRemain = HDA_PAGE_SIZE - ((virt + offset) & HDA_PAGE_MASK);
-        chunk = remain;
-        if (chunk > pageRemain)
-            chunk = pageRemain;
-        if (chunk > periodRemain)
-            chunk = periodRemain;
-        chunk &= ~3;
-        if (chunk == 0) {
+        if (!IntelHDAPlanBDLChunk(virt, offset, remain, periodRemain, &chunk,
+                                  &ioc)) {
             IOLog(
                 "%s: invalid BDL chunk virt 0x%08x remain %d periodRemain %d\n",
                 DRV_TITLE, virt + offset, remain, periodRemain);
             return -1;
         }
-
-        ioc = (chunk == periodRemain) ? 1 : 0;
         bdl[entries].addrLow = phys;
         bdl[entries].addrHigh = 0;
         bdl[entries].length = chunk;
@@ -1261,21 +1231,26 @@ static int hdaSetupOutputBDL(struct hda_state *s, unsigned int bytes,
 
 int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
                    unsigned int interruptBytes, unsigned int sampleRate,
-                   unsigned int bits, unsigned int channels) {
+                   unsigned int bits, unsigned int channels, BOOL mute,
+                   int leftAttenuation, int rightAttenuation) {
+    IntelHDARegisterOps ops;
     unsigned int base;
     unsigned int format;
     unsigned int period;
     unsigned int entries;
     unsigned int ctl;
 
-    if (s == NULL || !s->initialized || phys == 0 || bytes == 0)
+    if (s == NULL || !s->initialized || phys == 0 || bytes == 0) {
+        IOLog("%s: invalid DMA start state phys 0x%08x bytes %u\n",
+              DRV_TITLE, phys, bytes);
         return -1;
-    bytes &= ~3;
-    if (bytes == 0)
+    }
+    if ((bytes & 3U) || bytes != s->dmaBufferSize) {
+        IOLog("%s: invalid DMA size %u, reserved %u\n",
+              DRV_TITLE, bytes, s->dmaBufferSize);
         return -1;
-
-    hdaStopOutput(s);
-    hdaResetStream(s);
+    }
+    if (!hdaStopOutput(s) || !hdaResetStream(s)) return -1;
 
     if (!hdaBitsAreKnown(bits)) {
         IOLog("%s: unsupported stream bits %d rate %d channels %d pcmCaps "
@@ -1305,15 +1280,22 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
     }
     s->streamFormat = format;
     hdaProgramPath(s, format);
+    /* Restore the requested levels before RUN can fetch even the first
+     * period. Never briefly unmute or raise gain during a stream restart. */
+    hdaSetOutputVolume(s, mute, leftAttenuation, rightAttenuation);
 
     period = interruptBytes;
-    if (period == 0 || period > bytes)
-        period = bytes / 4;
-    if (period < 128)
-        period = bytes;
-    if (((bytes + period - 1) / period) > HDA_BDL_ENTRIES)
-        period = (bytes + HDA_BDL_ENTRIES - 1) / HDA_BDL_ENTRIES;
-    period = (period + 3) & ~3;
+    if (!IntelHDAPlaybackProgressStart(&s->progress, bytes, period,
+            sampleRate, channels * (bits / 8U), hdaRead32(s, HDA_REG_WALLCLK))) {
+        IOLog("%s: invalid playback geometry bytes %u period %u rate %u bits %u channels %u\n",
+              DRV_TITLE, bytes, period, sampleRate, bits, channels);
+        return -1;
+    }
+
+    /* Emulated DMA can lead WALLCLK by a bounded FIFO or whole period.
+     * The core shortens the safe observation interval by the same amount. */
+    s->progress.positionSlack = IntelHDAPlaybackPositionSlack(s->vendor,
+        s->device, s->subsystemVendor, s->subsystemDevice, s->codecVendor, period);
 
     if (hdaSetupOutputBDL(s, bytes, period, &entries))
         return -1;
@@ -1327,11 +1309,23 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
     hdaWrite8(s, base + HDA_SD_STS,
               HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE);
 
-    ctl = (s->streamTag << 20) | HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE |
-          HDA_SD_CTL_DEIE;
+    ctl = s->streamTag << 20;
+    if (s->interruptDeliveryEnabled)
+        ctl |= HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE;
     hdaWriteStreamControl(s, base, ctl);
-    hdaWrite32(s, HDA_REG_INTCTL, HDA_INT_GLOBAL | s->outputIntMask);
-    hdaWriteStreamControl(s, base, ctl | HDA_SD_CTL_RUN);
+    hdaWrite32(s, HDA_REG_INTCTL,
+               s->interruptDeliveryEnabled ?
+                   (HDA_INT_GLOBAL | s->outputIntMask) : 0);
+    s->progress.tick = hdaRead32(s, HDA_REG_WALLCLK);
+    ops = hdaRegisterOps(s);
+    /* Real controllers can take several link clocks to report RUN. */
+    if (!IntelHDAStartStream(&ops, base, HDA_POLL_COUNT, hdaStreamDelay)) {
+        IOLog("%s: stream RUN did not latch, control 0x%06x status 0x%02x\n",
+              DRV_TITLE, hdaReadStreamControl(s, base),
+              hdaRead8(s, base + HDA_SD_STS));
+        hdaStopOutput(s);
+        return -1;
+    }
 
     s->running = YES;
     s->outputInterrupt = NO;
@@ -1346,51 +1340,147 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
     return 0;
 }
 
-void hdaStopOutput(struct hda_state *s) {
-    unsigned int base;
+int hdaStopOutput(struct hda_state *s) {
+    IntelHDARegisterOps ops;
+    int stopped;
+    if (!s || !s->regs) return 1;
+    s->outputInterrupt = NO;
+    hdaWrite32(s, HDA_REG_INTCTL, 0);
+    /* Partial initialization has no stream: never touch offset zero as SDn. */
+    if (s->outputStreamBase < 0x80) return !s->running;
+    ops = hdaRegisterOps(s);
+    stopped = IntelHDAStopStream(&ops, s->outputStreamBase,
+                               HDA_POLL_COUNT, hdaStreamDelay);
+    if (stopped) s->running = NO;
+    else IOLog("%s: stream stop readback timed out; retain DMA\n", DRV_TITLE);
+    return stopped;
+}
+
+int hdaOutputPeriods(struct hda_state *s, unsigned *periods) {
+    unsigned position, tick;
+    if (!s || !s->regs || !s->running) return 0;
+    position = hdaRead32(s, s->outputStreamBase + HDA_SD_LPIB);
+    tick = hdaRead32(s, HDA_REG_WALLCLK);
+    if (!IntelHDAPlaybackProgressSample(&s->progress, position, tick, periods)) {
+        IOLog("%s: ambiguous DMA progress position %u previous %u elapsed %u ring %u carry %u period %u slack %u\n",
+              DRV_TITLE, position, s->progress.position,
+              tick - s->progress.tick, s->progress.ringTicks,
+              s->progress.remainder, s->progress.periodBytes,
+              s->progress.positionSlack);
+        return 0;
+    }
+    return 1;
+}
+
+int hdaOutputStatusPending(struct hda_state *s) {
+    return s && s->regs && s->outputStreamBase >= 0x80 &&
+        (hdaRead8(s, s->outputStreamBase + HDA_SD_STS) & 0x1cU);
+}
+
+unsigned hdaWallClock(struct hda_state *s) {
+    return s && s->regs ? hdaRead32(s, HDA_REG_WALLCLK) : 0;
+}
+
+unsigned hdaInterruptControl(struct hda_state *s) {
+    return s && s->regs ? hdaRead32(s, HDA_REG_INTCTL) : 0;
+}
+
+static unsigned int hdaServiceRead32(void *context, unsigned int offset) {
+    return hdaRead32((struct hda_state *)context, offset);
+}
+
+static unsigned int hdaServiceRead8(void *context, unsigned int offset) {
+    return hdaRead8((struct hda_state *)context, offset);
+}
+
+static void hdaServiceWrite32(void *context, unsigned int offset,
+                              unsigned int value) {
+    hdaWrite32((struct hda_state *)context, offset, value);
+}
+
+static void hdaServiceWrite8(void *context, unsigned int offset,
+                             unsigned int value) {
+    hdaWrite8((struct hda_state *)context, offset, value);
+}
+
+static IntelHDARegisterOps hdaRegisterOps(struct hda_state *s) {
+    IntelHDARegisterOps ops;
+    ops.context = s;
+    ops.read32 = hdaServiceRead32;
+    ops.read8 = hdaServiceRead8;
+    ops.write32 = hdaServiceWrite32;
+    ops.write8 = hdaServiceWrite8;
+    return ops;
+}
+
+void hdaQuiesceInterrupts(struct hda_state *s) {
+    unsigned int ctl;
+
+    if (s == NULL || s->regs == NULL)
+        return;
+    hdaWrite32(s, HDA_REG_INTCTL, 0);
+    if (s->outputStreamBase < 0x80) return;
+    ctl = hdaReadStreamControl(s, s->outputStreamBase);
+    ctl &= ~(HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE);
+    hdaWriteStreamControl(s, s->outputStreamBase, ctl);
+}
+
+void hdaAcknowledgePending(struct hda_state *s) {
+    unsigned char status;
+
+    if (s == NULL || s->regs == NULL)
+        return;
+    if (s->outputStreamBase < 0x80) return;
+    status = hdaRead8(s, s->outputStreamBase + HDA_SD_STS);
+    status &= HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE;
+    if (status != 0)
+        hdaWrite8(s, s->outputStreamBase + HDA_SD_STS, status);
+    /* Response status is enabled, but INTCTL.CIE always stays masked. */
+    if ((hdaRead8(s, HDA_REG_RIRBCTL) & 0x01) != 0) {
+        status = hdaRead8(s, HDA_REG_RIRBSTS) & 0x05;
+        if (status != 0)
+            hdaWrite8(s, HDA_REG_RIRBSTS, status);
+    }
+}
+
+void hdaSetOutputInterrupts(struct hda_state *s, BOOL enabled) {
     unsigned int ctl;
 
     if (s == NULL || s->regs == NULL)
         return;
 
-    base = s->outputStreamBase;
-    ctl = hdaReadStreamControl(s, base);
-    ctl &= ~HDA_SD_CTL_RUN;
-    hdaWriteStreamControl(s, base, ctl);
+    s->interruptDeliveryEnabled = enabled;
+    if (s->outputStreamBase < 0x80) return;
+    ctl = hdaReadStreamControl(s, s->outputStreamBase);
+    if (enabled && s->running)
+        ctl |= HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE;
+    else
+        ctl &= ~(HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE);
+    hdaWriteStreamControl(s, s->outputStreamBase, ctl);
     hdaWrite32(s, HDA_REG_INTCTL,
-               hdaRead32(s, HDA_REG_INTCTL) & ~s->outputIntMask);
-    hdaWrite8(s, base + HDA_SD_STS,
-              HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE);
-    s->running = NO;
+               enabled && s->running ? (HDA_INT_GLOBAL | s->outputIntMask) : 0);
 }
 
-int hdaHandleInterrupt(struct hda_state *s) {
-    unsigned int intsts;
-    unsigned int base;
-    unsigned char sdsts;
+int hdaServiceOutput(struct hda_state *s,
+                     IntelHDAInterruptResult *result) {
+    IntelHDARegisterOps ops;
+    int serviced;
 
-    if (s == NULL || s->regs == NULL)
+    if (s == NULL || s->regs == NULL || result == NULL)
         return 0;
-
-    intsts = hdaRead32(s, HDA_REG_INTSTS);
-    if ((intsts & s->outputIntMask) == 0)
+    ops.context = s;
+    ops.read32 = hdaServiceRead32;
+    ops.read8 = hdaServiceRead8;
+    ops.write32 = hdaServiceWrite32;
+    ops.write8 = hdaServiceWrite8;
+    serviced = IntelHDAServiceStreamInterrupt(&ops, s->outputStreamBase,
+                                               s->outputIntMask, result);
+    if (!serviced)
         return 0;
-
-    base = s->outputStreamBase;
-    sdsts = hdaRead8(s, base + HDA_SD_STS);
-    if (sdsts & (HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE))
-        hdaWrite8(s, base + HDA_SD_STS,
-                  sdsts &
-                      (HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE));
-
-    if (sdsts & (HDA_SD_STS_FIFOE | HDA_SD_STS_DESE))
+    if (result->errors != 0)
         IOLog("%s: stream error status 0x%02x LPIB 0x%08x INTSTS 0x%08x\n",
-              DRV_TITLE, sdsts, hdaRead32(s, base + HDA_SD_LPIB), intsts);
-
-    if (sdsts & HDA_SD_STS_BCIS) {
-        s->outputInterrupt = YES;
-        return 1;
-    }
-
-    return (sdsts != 0);
+              DRV_TITLE, result->streamStatus,
+              hdaRead32(s, s->outputStreamBase + HDA_SD_LPIB),
+              result->intsts);
+    return result->handled != 0;
 }

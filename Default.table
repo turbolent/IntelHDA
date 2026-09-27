@@ -2,9 +2,10 @@
 "Family" = "Audio";
 "Location" = "";
 "Bus Type" = "PCI";
-"Auto Detect IDs" = "0x26688086 0x1c208086";
+"Auto Detect IDs" = "0x26688086 0x1c208086 0xa2f08086";
 "Instance" = "0";
 "Driver Name" = "IntelHDADriver";
-"Share IRQ Levels" = "Yes";
-"Version" = "0.16";
-"Driver Version" = "0.16";
+"Class Names" = "IntelHDADriver";
+"Interrupt Mode" = "MSI";
+"Version" = "0.18";
+"Driver Version" = "0.18";

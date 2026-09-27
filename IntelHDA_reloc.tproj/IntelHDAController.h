@@ -2,6 +2,8 @@
 #define _INTEL_HDA_CONTROLLER_H_
 
 #import <objc/objc.h>
+#import "IntelHDAInterruptCore.h"
+#import "IntelHDAPlaybackCore.h"
 
 #define HDA_BDL_ENTRIES 32
 #define HDA_DMA_ALIGN   128
@@ -30,7 +32,7 @@ struct hda_state {
     unsigned char rev;
     unsigned short subsystemVendor;
     unsigned short subsystemDevice;
-    unsigned int irq;
+    unsigned int firmwareInterruptLine;
 
     unsigned int mmioPhys;
     unsigned int mmioSize;
@@ -68,8 +70,10 @@ struct hda_state {
     unsigned int dmaBufferVirt;
     unsigned int dmaBufferSize;
     unsigned int periodBytes;
+    IntelHDAPlaybackProgress progress;
 
     volatile BOOL outputInterrupt;
+    BOOL interruptDeliveryEnabled;
     BOOL running;
     BOOL initialized;
 };
@@ -78,9 +82,18 @@ int hdaInitController(struct hda_state *s);
 void hdaShutdownController(struct hda_state *s);
 int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
                    unsigned int interruptBytes, unsigned int sampleRate,
-                   unsigned int bits, unsigned int channels);
-void hdaStopOutput(struct hda_state *s);
-int hdaHandleInterrupt(struct hda_state *s);
+                   unsigned int bits, unsigned int channels, BOOL mute,
+                   int leftAttenuation, int rightAttenuation);
+int hdaStopOutput(struct hda_state *s);
+int hdaOutputPeriods(struct hda_state *s, unsigned *periods);
+int hdaOutputStatusPending(struct hda_state *s);
+unsigned hdaWallClock(struct hda_state *s);
+unsigned hdaInterruptControl(struct hda_state *s);
+void hdaQuiesceInterrupts(struct hda_state *s);
+void hdaAcknowledgePending(struct hda_state *s);
+void hdaSetOutputInterrupts(struct hda_state *s, BOOL enabled);
+int hdaServiceOutput(struct hda_state *s,
+                     IntelHDAInterruptResult *result);
 void hdaSetOutputVolume(struct hda_state *s, BOOL mute, int leftAttenuation,
                         int rightAttenuation);
 unsigned int hdaFormatForParams(unsigned int rate, unsigned int bits,
