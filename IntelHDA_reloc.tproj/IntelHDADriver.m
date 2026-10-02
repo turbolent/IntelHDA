@@ -25,8 +25,8 @@
 #define INTEL_Q270_HDA_DEVICE_ID 0xa2f0U
 #define INTEL_SCH_HDA_DEVC          0x78U
 #define INTEL_SCH_HDA_DEVC_NOSNOOP  0x00000800U
-#define HDA_IOAUDIO_DMA_SIZE        0x4000U
-#define HDA_IOAUDIO_DESCRIPTOR_SIZE 0x0800U
+#define HDA_IOAUDIO_DMA_SIZE        0x8000U
+#define HDA_IOAUDIO_DESCRIPTOR_SIZE 0x1000U
 #define HDA_WORKER_MS               4U
 
 static void hdaInterruptWorker(void *argument);
@@ -58,11 +58,14 @@ static void restoreRawInterrupts(unsigned flags) {
 - _outputChannel;
 - (void)_interruptOccurred;
 - (void)_stopDMAForChannel:channel;
+- (void)_dataPendingForChannel:channel;
 @end
 @interface Object (IntelHDAAudioChannelPrivate)
 - (void)setDMASize:(unsigned)size;
 - (unsigned)setDescriptorSize:(unsigned)size;
 - (BOOL)createChannelBuffer;
+- (unsigned)enqueueCount;
+- (unsigned)dmaCount;
 @end
 @interface IntelHDADriver (IntelHDAPrivate)
 - (BOOL)_readPCIConfigImage:(unsigned *)image;
@@ -74,6 +77,10 @@ static void restoreRawInterrupts(unsigned flags) {
 - (BOOL)_disableAndReleasePCIMSI;
 - (BOOL)_activateMSI;
 - (int)_servicePlaybackPass;
+- (int)_samplePlayback:(unsigned *)periods;
+- (unsigned)_queuedOutputPeriods;
+- (void)_completeOutputPeriod;
+- (int)_resynchronizeOutput;
 - (int)_outputReady;
 - (int)_finishMSIPass:(int)acknowledge pending:(unsigned *)pending;
 - (void)_containPlayback:(const char *)reason;
@@ -87,6 +94,18 @@ static int outputReady(void *context) {
 static int finishPass(void *context, int acknowledge, unsigned *pending) {
     return [(IntelHDADriver *)context _finishMSIPass:acknowledge pending:pending];
 }
+static int refillSample(void *context, unsigned *periods) {
+    return [(IntelHDADriver *)context _samplePlayback:periods];
+}
+static unsigned refillQueued(void *context) {
+    return [(IntelHDADriver *)context _queuedOutputPeriods];
+}
+static void refillComplete(void *context) {
+    [(IntelHDADriver *)context _completeOutputPeriod];
+}
+static const IntelHDARefillOps refillOps = {
+    refillSample, refillQueued, refillComplete
+};
 static const IntelHDAMSIEpochOps epochOps = {servicePass, outputReady, finishPass};
 static const char *encodingName(unsigned int encoding) {
     switch (encoding) {
@@ -397,6 +416,7 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
     unsigned channels;
     unsigned rate;
     unsigned bits;
+    int startResult;
     BOOL ok;
     if (isRead || _stateLock == nil)
         return NO;
@@ -419,20 +439,26 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
     }
     if (!hdaBitsAreSupported(gHDA, bits))
         HDA_VLOG(("%s: trying unadvertised PCM width %u\n", DRV_TITLE, bits));
-    if (!hdaRateIsSupported(gHDA, rate))
-        HDA_VLOG(("%s: trying unadvertised sample rate %u\n", DRV_TITLE, rate));
+    if (!hdaRateIsSupported(gHDA, rate)) {
+        IOLog("%s: rejecting unverified sample rate %u\n", DRV_TITLE, rate);
+        [_stateLock unlock];
+        return NO;
+    }
     hdaSetOutputInterrupts(gHDA, _msiRequested && _msiActive);
-    ok = hdaStartOutput(gHDA, (unsigned)buffer, gHDA->dmaBufferSize,
+    startResult = hdaStartOutput(gHDA, (unsigned)buffer, gHDA->dmaBufferSize,
                         bufferSize, rate, bits, channels, [self isOutputMuted],
                         [self outputAttenuationLeft],
-                        [self outputAttenuationRight]) == 0;
+                        [self outputAttenuationRight],
+                        [[self _outputChannel] enqueueCount]);
+    ok = startResult == 0;
     if (!ok)
         IOLog("%s: failed to start output stream\n", DRV_TITLE);
     _lastServiceEndTick = hdaWallClock(gHDA);
     _lastServiceTailTicks = 0;
     _lastRefillTicks = 0;
     [_stateLock unlock];
-    if (!ok) [self _containPlayback:"stream start/reset failed"];
+    if (!ok && startResult != HDA_START_CONFIG_REJECTED)
+        [self _containPlayback:"stream start/reset failed"];
     /* VirtualBox recreates its host mixer at RUN and loses the volume set
      * before RUN. Reapply after startup as well; physical hardware already
      * had the requested mute/attenuation before its first DMA fetch. */
@@ -446,6 +472,7 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
     [_stateLock lock];
     stopped = !gHDA || hdaStopOutput(gHDA);
     if (gHDA) gHDA->outputInterrupt = NO;
+    _completionTimestamp = 0;
     if (!stopped) { _quarantined = YES; _stopping = YES; _msiUnsafeToFree = YES; }
     [_stateLock unlock];
 }
@@ -469,13 +496,80 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
 }
 - (ns_time_t)_lastInterruptTimeStamp { return _completionTimestamp; }
 
+/* The queue and all completion calls belong to IOAudio's one service thread.
+ * The lock protects hardware/status access, never a superclass callback. */
+- (int)_samplePlayback:(unsigned *)periods {
+    int result;
+    [_stateLock lock];
+    if (_stopping || !gHDA || !gHDA->running) result = -1;
+    else {
+        result = hdaOutputPeriods(gHDA, periods);
+        if (result && *periods > _maxPeriodBatch) _maxPeriodBatch = *periods;
+    }
+    [_stateLock unlock];
+    return result;
+}
+
+- (unsigned)_queuedOutputPeriods {
+    id channel = [self _outputChannel];
+    unsigned queued = [channel enqueueCount];
+    [_stateLock lock];
+    _lastQueueDepth = queued;
+    [_stateLock unlock];
+    return queued <= [channel dmaCount] ? queued : 0;
+}
+
+- (void)_completeOutputPeriod {
+    unsigned tick, elapsed, queuedBefore, queuedAfter, generation;
+    id channel = [self _outputChannel];
+    queuedBefore = [channel enqueueCount];
+    [_stateLock lock];
+    gHDA->outputInterrupt = YES;
+    generation = gHDA->streamGeneration;
+    tick = hdaWallClock(gHDA);
+    [_stateLock unlock];
+    /* IOAudio may reenter stopDMAForChannel:read:. */
+    [super _interruptOccurred];
+    queuedAfter = [channel enqueueCount];
+    [_stateLock lock];
+    /* IOAudio retires one descriptor, then attempts one enqueue at its tail.
+     * Convert that newly enqueued slot, which is ahead of the retired slot.
+     * A reentrant stop/start already rebuilt and converted the new queue. */
+    if (gHDA->running && generation == gHDA->streamGeneration &&
+        queuedBefore && queuedAfter == queuedBefore)
+        hdaRefillConvertedOutput(gHDA);
+    _completedPeriods++;
+    if (!_msiRequested) _pollCompletions++;
+    elapsed = hdaWallClock(gHDA) - tick;
+    if (elapsed > _maxRefillTicks) _maxRefillTicks = elapsed;
+    [_stateLock unlock];
+}
+
+- (int)_resynchronizeOutput {
+    id channel = [self _outputChannel];
+    int ok;
+    [_stateLock lock];
+    ok = !_stopping && hdaStopOutput(gHDA);
+    if (ok) _queueResynchronizations++;
+    [_stateLock unlock];
+    if (!ok) return 0;
+    /* Stop first. Retire/discard the old software queue and reset its physical
+     * ordering using IOAudio's own method, not private structure writes.
+     * Its pending-data message starts remaining regions from a fresh queue.
+     * A short silence/drop is preferable to endlessly replaying stale PCM. */
+    [super _stopDMAForChannel:channel];
+    [_stateLock lock];
+    ok = !_stopping;
+    _completionTimestamp = 0;
+    [_stateLock unlock];
+    if (ok) [self _dataPendingForChannel:channel];
+    return ok;
+}
+
 - (int)_servicePlaybackPass {
     IntelHDAInterruptResult service;
-    unsigned periods, i;
     unsigned entryTick, lockedTick, sampledTick, refillTick;
-    int ok;
-    /* Timing only: no additional servicing or change to the lap guard.
-     * MMIO remains pinned for the lifetime of this owner. */
+    int ok, refillResult;
     entryTick = hdaWallClock(gHDA);
     [_stateLock lock];
     if (_stopping || !_ready || !gHDA) { [_stateLock unlock]; return 0; }
@@ -485,9 +579,7 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
     if (_msiTestFault == HDA_MSI_TEST_STREAM_ERROR)
         service.errors |= HDA_INTERRUPT_STREAM_DESE;
     ok = !service.errors && !service.exhausted;
-    periods = 0;
     sampledTick = hdaWallClock(gHDA);
-    if (ok && gHDA->running) ok = hdaOutputPeriods(gHDA, &periods);
     gHDA->outputInterrupt = NO;
     if (!ok) {
         _streamErrors++;
@@ -499,18 +591,11 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
     [_stateLock unlock];
     if (!ok) return 0;
     refillTick = hdaWallClock(gHDA);
-    for (i = 0; i < periods; i++) {
-        [_stateLock lock];
-        if (_stopping || !gHDA->running) { [_stateLock unlock]; break; }
-        gHDA->outputInterrupt = YES;
-        _completedPeriods++;
-        if (!_msiRequested) _pollCompletions++;
-        [_stateLock unlock];
-        /* IOAudio may call stopDMAForChannel:read: here. No lock held. */
-        [super _interruptOccurred];
-    }
-    _lastRefillTicks = hdaWallClock(gHDA) - refillTick;
+    refillResult = IntelHDARefillRun(self, &refillOps);
+    if (refillResult == HDA_REFILL_RESYNC && ![self _resynchronizeOutput])
+        return 0;
     [_stateLock lock];
+    _lastRefillTicks = hdaWallClock(gHDA) - refillTick;
     if (!_stopping) hdaSetOutputInterrupts(gHDA, _msiRequested && _msiActive);
     ok = !_stopping;
     _lastServiceEndTick = hdaWallClock(gHDA);
@@ -929,6 +1014,16 @@ static void hdaInterruptWorker(void *argument) {
     values[INTEL_HDA_STAT_DAC] = gHDA ? gHDA->dac : 0;
     values[INTEL_HDA_STAT_DMA_BYTES] = gHDA ? gHDA->dmaBufferSize : 0;
     values[INTEL_HDA_STAT_PERIOD_BYTES] = gHDA ? gHDA->periodBytes : 0;
+    values[INTEL_HDA_STAT_QUEUE_RESYNCHRONIZATIONS] = _queueResynchronizations;
+    values[INTEL_HDA_STAT_MAX_PERIOD_BATCH] = _maxPeriodBatch;
+    values[INTEL_HDA_STAT_MAX_REFILL_TICKS] = _maxRefillTicks;
+    values[INTEL_HDA_STAT_LAST_QUEUE_DEPTH] = _lastQueueDepth;
+    values[INTEL_HDA_STAT_CODEC_SETUP_FAILURES] = gHDA ? gHDA->codecSetupFailures : 0;
+    values[INTEL_HDA_STAT_STREAM_FORMAT] = gHDA ? gHDA->streamFormat : 0;
+    values[INTEL_HDA_STAT_VERIFIED_RATES] = gHDA ? gHDA->verifiedRateMask : 0;
+    values[INTEL_HDA_STAT_SOURCE_RATE] = gHDA ? gHDA->sourceRate : 0;
+    values[INTEL_HDA_STAT_HARDWARE_RATE] = gHDA ? gHDA->hardwareRate : 0;
+    values[INTEL_HDA_STAT_HARDWARE_DMA_BYTES] = gHDA ? gHDA->hardwareBufferBytes : 0;
     values[INTEL_HDA_STAT_INTCTL] = hdaInterruptControl(gHDA);
     values[INTEL_HDA_STAT_PCI_COMMAND] =
         [self getPCIConfigData:&pciValue atRegister:4] == IO_R_SUCCESS ? pciValue & 0xffffU : ~0U;

@@ -7,5 +7,5 @@
 "Driver Name" = "IntelHDADriver";
 "Class Names" = "IntelHDADriver";
 "Interrupt Mode" = "MSI";
-"Version" = "0.18";
-"Driver Version" = "0.18";
+"Version" = "0.19";
+"Driver Version" = "0.19";

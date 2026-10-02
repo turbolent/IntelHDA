@@ -2,7 +2,11 @@
 
 IntelHDA is an OPENSTEP 4.2 driver for Intel High Definition Audio controllers.
 It provides analog playback through one codec and output path, supporting
-16-bit PCM mono/stereo at 8, 16, 22.05, 32, 44.1 and 48 kHz.
+16-bit PCM mono/stereo. The driver probes 8, 16, 22.05, 32, 44.1 and 48 kHz
+while stopped and verifies the selected codec's format register. If the codec
+supports 44.1 kHz but not 22.05 kHz, the driver converts 22.05 kHz playback to
+44.1 kHz so OS sound effects remain available. Other available rates depend
+on the codec.
 Recording, 8-bit PCM and 11.025 kHz playback are unsupported.
 
 ## Requirements
@@ -62,4 +66,3 @@ To check the loaded driver, selected output and interrupt status, run:
 ```sh
 /private/Drivers/i386/IntelHDA.config/intelhda-status
 ```
-

@@ -4,11 +4,14 @@
 #import <objc/objc.h>
 #import "IntelHDAInterruptCore.h"
 #import "IntelHDAPlaybackCore.h"
+#import "IntelHDARateCore.h"
 
 #define HDA_BDL_ENTRIES 32
 #define HDA_DMA_ALIGN   128
 #define HDA_PAGE_SIZE   4096
 #define HDA_PAGE_MASK   (HDA_PAGE_SIZE - 1)
+/* Required codec/controller configuration failed with DMA proven stopped. */
+#define HDA_START_CONFIG_REJECTED (-2)
 
 struct hda_dma_area {
     void *alloc;
@@ -49,6 +52,7 @@ struct hda_state {
     struct hda_dma_area corb;
     struct hda_dma_area rirb;
     struct hda_dma_area bdl;
+    struct hda_dma_area converted;
     unsigned int corbEntries;
     unsigned int rirbEntries;
     unsigned int corbWp;
@@ -63,6 +67,8 @@ struct hda_state {
     unsigned int pathSelect[8];
     unsigned int pathLength;
     unsigned int streamFormat;
+    unsigned int codecSetupFailures;
+    unsigned int verifiedRateMask;
     unsigned int pcmCaps;
     unsigned int streamCaps;
 
@@ -70,6 +76,10 @@ struct hda_state {
     unsigned int dmaBufferVirt;
     unsigned int dmaBufferSize;
     unsigned int periodBytes;
+    unsigned int sourceRate, hardwareRate, hardwareBufferBytes;
+    unsigned int streamGeneration;
+    BOOL converting;
+    IntelHDARateConverter converter;
     IntelHDAPlaybackProgress progress;
 
     volatile BOOL outputInterrupt;
@@ -83,7 +93,9 @@ void hdaShutdownController(struct hda_state *s);
 int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
                    unsigned int interruptBytes, unsigned int sampleRate,
                    unsigned int bits, unsigned int channels, BOOL mute,
-                   int leftAttenuation, int rightAttenuation);
+                   int leftAttenuation, int rightAttenuation,
+                   unsigned int queuedPeriods);
+void hdaRefillConvertedOutput(struct hda_state *s);
 int hdaStopOutput(struct hda_state *s);
 int hdaOutputPeriods(struct hda_state *s, unsigned *periods);
 int hdaOutputStatusPending(struct hda_state *s);

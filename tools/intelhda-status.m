@@ -82,6 +82,16 @@ int main(int argc, char **argv) {
     printf("DMA bytes %u period bytes %u INTCTL 0x%08x\n",
            values[INTEL_HDA_STAT_DMA_BYTES], values[INTEL_HDA_STAT_PERIOD_BYTES],
            values[INTEL_HDA_STAT_INTCTL]);
+    printf("queue resynchronizations %u, largest period batch %u, last queue depth %u\n",
+           values[INTEL_HDA_STAT_QUEUE_RESYNCHRONIZATIONS],
+           values[INTEL_HDA_STAT_MAX_PERIOD_BATCH], values[INTEL_HDA_STAT_LAST_QUEUE_DEPTH]);
+    printf("longest refill %u ticks (24 MHz), codec setup failures %u, format 0x%04x\n",
+           values[INTEL_HDA_STAT_MAX_REFILL_TICKS], values[INTEL_HDA_STAT_CODEC_SETUP_FAILURES],
+           values[INTEL_HDA_STAT_STREAM_FORMAT]);
+    printf("verified rate mask 0x%04x\n", values[INTEL_HDA_STAT_VERIFIED_RATES]);
+    printf("source rate %u hardware rate %u hardware DMA bytes %u\n",
+           values[INTEL_HDA_STAT_SOURCE_RATE], values[INTEL_HDA_STAT_HARDWARE_RATE],
+           values[INTEL_HDA_STAT_HARDWARE_DMA_BYTES]);
     printf("PCI command 0x%04x MSI control 0x%04x MSI-X control 0x%04x\n",
            values[INTEL_HDA_STAT_PCI_COMMAND], values[INTEL_HDA_STAT_MSI_CONTROL],
            values[INTEL_HDA_STAT_MSIX_CONTROL]);

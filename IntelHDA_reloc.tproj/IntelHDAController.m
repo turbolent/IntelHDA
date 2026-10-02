@@ -6,6 +6,7 @@
 #import "IntelHDAController.h"
 #import "IntelHDADriver.h"
 #import "IntelHDAPlaybackCore.h"
+#import "IntelHDACodecCore.h"
 
 #define HDA_REG_GCAP      0x00
 #define HDA_REG_VMIN      0x02
@@ -60,6 +61,9 @@
 #define HDA_VERB_GET_PIN_CONTROL    0xf07
 #define HDA_VERB_GET_PIN_SENSE      0xf09
 #define HDA_VERB_GET_AMP_GAIN_MUTE  0x0b00
+#define HDA_VERB_GET_STREAM_FORMAT  0xa00
+#define HDA_VERB_GET_STREAM_CHANNEL 0xf06
+#define HDA_VERB_GET_EAPD           0xf0c
 #define HDA_VERB_SET_STREAM_FORMAT  0x200
 #define HDA_VERB_SET_AMP_GAIN_MUTE  0x300
 #define HDA_VERB_SET_CONN_SELECT    0x701
@@ -858,37 +862,74 @@ static int hdaQuerySelectedPCM(struct hda_state *s) {
     return 0;
 }
 
-static void hdaProgramPath(struct hda_state *s, unsigned int format) {
-    unsigned int i;
-    unsigned int nid;
-    unsigned int caps;
-    unsigned int pinCaps;
-    unsigned int pinCtl;
+static int hdaCodecCoreCommand(void *context, unsigned nid,
+    unsigned verb, unsigned payload, unsigned *response) {
+    return hdaCodecCommand((struct hda_state *)context, nid, verb, payload, response);
+}
+
+static int hdaVerifySetting(struct hda_state *s, unsigned nid,
+    unsigned setVerb, unsigned value, unsigned getVerb, unsigned mask) {
+    unsigned observed;
+    if (IntelHDACodecWriteVerified(s, hdaCodecCoreCommand, nid,
+            setVerb, value, getVerb, 0, value, mask, &observed)) return 1;
+    IOLog("%s: codec setting failed nid 0x%x verb 0x%x wanted 0x%x read 0x%x\n",
+          DRV_TITLE, nid, setVerb, value, observed);
+    return 0;
+}
+
+static int hdaProbeOutputRates(struct hda_state *s) {
+    unsigned i, format, observed;
+    s->verifiedRateMask = 0;
+    /* Probe while DMA is stopped. Preserve unadvertised rates only if the
+     * converter actually retains them; never promise a format it discards. */
+    for (i = 0; hdaRateTable[i].rate; i++) {
+        format = hdaFormatForParams(hdaRateTable[i].rate, 16, 2);
+        if (!format) continue; /* Capability table also describes rates >48 kHz. */
+        if (IntelHDACodecWriteVerified(s, hdaCodecCoreCommand, s->dac,
+                HDA_VERB_SET_STREAM_FORMAT, format, HDA_VERB_GET_STREAM_FORMAT,
+                0, format, 0xffff, &observed)) {
+            s->verifiedRateMask |= hdaRateTable[i].capBit;
+        } else {
+            IOLog("%s: rate %u format 0x%x readback 0x%x not retained\n",
+                  DRV_TITLE, hdaRateTable[i].rate, format, observed);
+            if (observed == ~0U) { s->codecSetupFailures++; return -1; }
+        }
+    }
+    IOLog("%s: verified output rate mask 0x%x\n", DRV_TITLE, s->verifiedRateMask);
+    return s->verifiedRateMask ? 0 : -1;
+}
+
+static int hdaProgramPath(struct hda_state *s, unsigned int format) {
+    unsigned int i, nid, caps, pinCaps, pinCtl;
 
     for (i = 0; i + 1 < s->pathLength; i++) {
         nid = s->path[i];
         if (hdaGetParam(s, nid, HDA_PARAM_AUDIO_WIDGET_CAPS, &caps))
-            continue;
+            goto failed;
         if (hdaWidgetType(caps) == HDA_WIDGET_AUDIO_SELECTOR ||
             hdaWidgetType(caps) == HDA_WIDGET_PIN_COMPLEX) {
-            (void)hdaCodecCommand(s, nid, HDA_VERB_SET_CONN_SELECT,
-                                  s->pathSelect[i], NULL);
+            if (!hdaVerifySetting(s, nid, HDA_VERB_SET_CONN_SELECT,
+                    s->pathSelect[i], HDA_VERB_GET_CONN_SELECT, 0xff)) goto failed;
         }
     }
+    if (!hdaVerifySetting(s, s->dac, HDA_VERB_SET_STREAM_FORMAT,
+            format, HDA_VERB_GET_STREAM_FORMAT, 0xffff) ||
+        !hdaVerifySetting(s, s->dac, HDA_VERB_SET_STREAM_CHANNEL,
+            s->streamTag << 4, HDA_VERB_GET_STREAM_CHANNEL, 0xff)) goto failed;
 
-    (void)hdaCodecCommand(s, s->dac, HDA_VERB_SET_STREAM_FORMAT, format, NULL);
-    (void)hdaCodecCommand(s, s->dac, HDA_VERB_SET_STREAM_CHANNEL,
-                          (s->streamTag << 4), NULL);
-
+    if (hdaGetParam(s, s->pin, HDA_PARAM_PIN_CAPS, &pinCaps)) goto failed;
     pinCtl = HDA_PINCTL_OUT_ENABLE;
-    if (hdaGetParam(s, s->pin, HDA_PARAM_PIN_CAPS, &pinCaps) == 0) {
-        if (pinCaps & HDA_PINCAP_HEADPHONE)
-            pinCtl |= HDA_PINCTL_HP_ENABLE;
-        if (pinCaps & HDA_PINCAP_EAPD)
-            (void)hdaCodecCommand(s, s->pin, HDA_VERB_SET_EAPD, 0x02, NULL);
-    }
-
-    (void)hdaCodecCommand(s, s->pin, HDA_VERB_SET_PIN_CONTROL, pinCtl, NULL);
+    if (pinCaps & HDA_PINCAP_HEADPHONE) pinCtl |= HDA_PINCTL_HP_ENABLE;
+    if ((pinCaps & HDA_PINCAP_EAPD) &&
+        !hdaVerifySetting(s, s->pin, HDA_VERB_SET_EAPD,
+            0x02, HDA_VERB_GET_EAPD, 0x02)) goto failed;
+    if (!hdaVerifySetting(s, s->pin, HDA_VERB_SET_PIN_CONTROL,
+            pinCtl, HDA_VERB_GET_PIN_CONTROL, 0xff)) goto failed;
+    s->streamFormat = format;
+    return 0;
+failed:
+    s->codecSetupFailures++;
+    return -1;
 }
 
 static int hdaSetupRings(struct hda_state *s) {
@@ -991,26 +1032,26 @@ unsigned int hdaFormatForParams(unsigned int rate, unsigned int bits,
     return IntelHDAPlaybackFormat(rate, bits, channels);
 }
 
-int hdaRateIsSupported(struct hda_state *s, unsigned int rate) {
+static int hdaRateIsNative(struct hda_state *s, unsigned int rate) {
     unsigned int i;
 
     if (s == NULL)
         return 0;
     for (i = 0; hdaRateTable[i].rate != 0; i++) {
         if (hdaRateTable[i].rate == rate)
-            return ((s->pcmCaps & hdaRateTable[i].capBit) != 0);
+            return (((s->verifiedRateMask ? s->verifiedRateMask : s->pcmCaps) &
+                     hdaRateTable[i].capBit) != 0);
     }
     return 0;
 }
 
-int hdaRateIsKnown(unsigned int rate) {
-    unsigned int i;
+int hdaRateIsSupported(struct hda_state *s, unsigned int rate) {
+    return hdaRateIsNative(s, rate) ||
+        (rate == 22050 && s && s->converted.vaddr && hdaRateIsNative(s, 44100));
+}
 
-    for (i = 0; hdaRateTable[i].rate != 0; i++) {
-        if (hdaRateTable[i].rate == rate)
-            return 1;
-    }
-    return 0;
+int hdaRateIsKnown(unsigned int rate) {
+    return IntelHDAPlaybackFormat(rate, 16, 2) != 0;
 }
 
 int hdaBitsAreSupported(struct hda_state *s, unsigned int bits) {
@@ -1027,13 +1068,17 @@ int hdaBitsAreKnown(unsigned int bits) { return (bits == 8 || bits == 16); }
 
 void hdaGetSupportedRates(struct hda_state *s, int *rates,
                           unsigned int *numRates) {
-    unsigned i;
-    /* Preserve the established IOAudio formats, including ALC889 22050 Hz
-     * even when its codec capability bitmap does not advertise that rate. */
-    (void)s;
-    for (i = 0; i < 6; i++)
-        if (rates) rates[i] = hdaRateTable[i].rate;
-    if (numRates) *numRates = 6;
+    unsigned i, count, mask;
+    /* IOAudio may ask during initialization, before the stopped-codec probe. */
+    mask = s && s->verifiedRateMask ? s->verifiedRateMask : 0x60;
+    if (s && s->converted.vaddr && (mask & 0x20)) mask |= 0x08;
+    count = 0;
+    for (i = 0; hdaRateTable[i].rate; i++) {
+        if (!(mask & hdaRateTable[i].capBit)) continue;
+        if (rates) rates[count] = hdaRateTable[i].rate;
+        count++;
+    }
+    if (numRates) *numRates = count;
 }
 
 unsigned int hdaDefaultFormat(struct hda_state *s) {
@@ -1113,9 +1158,25 @@ int hdaInitController(struct hda_state *s) {
         return -1;
     if (hdaQuerySelectedPCM(s))
         return -1;
+    if (hdaProbeOutputRates(s)) return -1;
 
+    if (!hdaRateIsNative(s, 22050) && hdaRateIsNative(s, 44100)) {
+        /* The BDL translates every page; this ring needs wired kernel memory,
+         * not the small ISA low-memory pool used by the command rings. */
+        s->converted.allocSize = 65536 + HDA_PAGE_SIZE;
+        s->converted.alloc = IOMalloc(s->converted.allocSize);
+        if (!s->converted.alloc) {
+            IOLog("%s: cannot reserve 22050 Hz conversion buffer\n", DRV_TITLE);
+            return -1;
+        }
+        s->converted.vaddr = hdaAlignPtr(s->converted.alloc, HDA_PAGE_SIZE);
+        s->converted.size = 65536;
+        bzero(s->converted.vaddr, s->converted.size);
+        IOLog("%s: 22050 Hz playback converted to verified 44100 Hz\n", DRV_TITLE);
+    }
+
+    if (hdaProgramPath(s, hdaDefaultFormat(s))) return -1;
     s->initialized = YES;
-    hdaProgramPath(s, hdaDefaultFormat(s));
     hdaSetOutputVolume(s, YES, 0, 0);
     IOLog("%s: initialized codec path pin 0x%x DAC 0x%x\n", DRV_TITLE, s->pin,
           s->dac);
@@ -1134,6 +1195,9 @@ void hdaShutdownController(struct hda_state *s) {
         if (hdaRead8(s, HDA_REG_CORBCTL) || hdaRead8(s, HDA_REG_RIRBCTL)) return;
     }
 
+    if (s->converted.alloc)
+        IOFree(s->converted.alloc, s->converted.allocSize);
+    bzero(&s->converted, sizeof(s->converted));
     hdaFreeDMA(&s->bdl);
     hdaFreeDMA(&s->rirb);
     hdaFreeDMA(&s->corb);
@@ -1153,22 +1217,20 @@ static int hdaResetStream(struct hda_state *s) {
     return ok;
 }
 
-static int hdaSetupOutputBDL(struct hda_state *s, unsigned int bytes,
+static int hdaSetupOutputBDL(struct hda_state *s, unsigned int virt, unsigned int bytes,
                              unsigned int period, unsigned int *entriesOut) {
     struct hda_bdl_entry *bdl;
-    unsigned int virt;
     unsigned int offset;
     unsigned int remain;
     unsigned int periodRemain;
     unsigned int entries;
 
-    if (s->dmaBufferVirt == 0)
+    if (virt == 0)
         return -1;
 
     bdl = (struct hda_bdl_entry *)s->bdl.vaddr;
     bzero(bdl, s->bdl.size);
 
-    virt = s->dmaBufferVirt;
     offset = 0;
     remain = bytes;
     periodRemain = period;
@@ -1232,13 +1294,15 @@ static int hdaSetupOutputBDL(struct hda_state *s, unsigned int bytes,
 int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
                    unsigned int interruptBytes, unsigned int sampleRate,
                    unsigned int bits, unsigned int channels, BOOL mute,
-                   int leftAttenuation, int rightAttenuation) {
+                   int leftAttenuation, int rightAttenuation,
+                   unsigned int queuedPeriods) {
     IntelHDARegisterOps ops;
     unsigned int base;
     unsigned int format;
     unsigned int period;
     unsigned int entries;
     unsigned int ctl;
+    unsigned int sourceRate, virt, i;
 
     if (s == NULL || !s->initialized || phys == 0 || bytes == 0) {
         IOLog("%s: invalid DMA start state phys 0x%08x bytes %u\n",
@@ -1251,6 +1315,10 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
         return -1;
     }
     if (!hdaStopOutput(s) || !hdaResetStream(s)) return -1;
+    s->converting = NO;
+    sourceRate = sampleRate;
+    virt = s->dmaBufferVirt;
+    period = interruptBytes;
 
     if (!hdaBitsAreKnown(bits)) {
         IOLog("%s: unsupported stream bits %d rate %d channels %d pcmCaps "
@@ -1264,27 +1332,38 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
               DRV_TITLE, sampleRate, bits, channels, s->pcmCaps);
         return -1;
     }
-    if (!hdaRateIsSupported(s, sampleRate))
-        HDA_VLOG(("%s: trying unadvertised stream rate %d pcmCaps 0x%08x\n",
-                  DRV_TITLE, sampleRate, s->pcmCaps));
+    if (!hdaRateIsSupported(s, sampleRate)) return HDA_START_CONFIG_REJECTED;
     if (!hdaBitsAreSupported(s, bits))
         HDA_VLOG(("%s: trying unadvertised stream bits %d pcmCaps 0x%08x "
                   "streamCaps 0x%08x\n",
                   DRV_TITLE, bits, s->pcmCaps, s->streamCaps));
 
+    if (sampleRate == 22050 && !hdaRateIsNative(s, sampleRate)) {
+        if (bits != 16 || !s->converted.vaddr ||
+            !IntelHDARateStart(&s->converter, bytes, period, channels) ||
+            !queuedPeriods || queuedPeriods > s->converter.periods)
+            return HDA_START_CONFIG_REJECTED;
+        bzero(s->converted.vaddr, s->converted.size);
+        for (i = 0; i < queuedPeriods; i++)
+            IntelHDARateConvertPeriod(&s->converter, s->converted.vaddr,
+                                     (void *)s->dmaBufferVirt);
+        s->converting = YES;
+        virt = (unsigned)s->converted.vaddr;
+        bytes *= 2;
+        period *= 2;
+        sampleRate = 44100;
+    }
     format = hdaFormatForParams(sampleRate, bits, channels);
     if (format == 0) {
         IOLog("%s: invalid stream format rate %d bits %d channels %d\n",
               DRV_TITLE, sampleRate, bits, channels);
         return -1;
     }
-    s->streamFormat = format;
-    hdaProgramPath(s, format);
+    if (hdaProgramPath(s, format)) return HDA_START_CONFIG_REJECTED;
     /* Restore the requested levels before RUN can fetch even the first
      * period. Never briefly unmute or raise gain during a stream restart. */
     hdaSetOutputVolume(s, mute, leftAttenuation, rightAttenuation);
 
-    period = interruptBytes;
     if (!IntelHDAPlaybackProgressStart(&s->progress, bytes, period,
             sampleRate, channels * (bits / 8U), hdaRead32(s, HDA_REG_WALLCLK))) {
         IOLog("%s: invalid playback geometry bytes %u period %u rate %u bits %u channels %u\n",
@@ -1297,7 +1376,7 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
     s->progress.positionSlack = IntelHDAPlaybackPositionSlack(s->vendor,
         s->device, s->subsystemVendor, s->subsystemDevice, s->codecVendor, period);
 
-    if (hdaSetupOutputBDL(s, bytes, period, &entries))
+    if (hdaSetupOutputBDL(s, virt, bytes, period, &entries))
         return -1;
 
     base = s->outputStreamBase;
@@ -1306,6 +1385,11 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
     hdaWrite32(s, base + HDA_SD_CBL, bytes);
     hdaWrite16(s, base + HDA_SD_LVI, entries - 1);
     hdaWrite16(s, base + HDA_SD_FORMAT, format);
+    if (hdaRead16(s, base + HDA_SD_FORMAT) != format) {
+        s->codecSetupFailures++;
+        IOLog("%s: controller format readback failed, wanted 0x%x\n", DRV_TITLE, format);
+        return HDA_START_CONFIG_REJECTED;
+    }
     hdaWrite8(s, base + HDA_SD_STS,
               HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE);
 
@@ -1330,7 +1414,10 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
     s->running = YES;
     s->outputInterrupt = NO;
     s->dmaBufferPhys = phys;
-    s->dmaBufferSize = bytes;
+    s->sourceRate = sourceRate;
+    s->hardwareRate = sampleRate;
+    s->hardwareBufferBytes = bytes;
+    s->streamGeneration++;
     s->periodBytes = period;
 
     HDA_VLOG(("%s: start output virt 0x%08x phys 0x%08x bytes %d period %d "
@@ -1338,6 +1425,12 @@ int hdaStartOutput(struct hda_state *s, unsigned int phys, unsigned int bytes,
               DRV_TITLE, s->dmaBufferVirt, phys, bytes, period, entries,
               sampleRate, bits, channels, format, s->bdl.paddr));
     return 0;
+}
+
+void hdaRefillConvertedOutput(struct hda_state *s) {
+    if (s && s->running && s->converting)
+        IntelHDARateConvertPeriod(&s->converter, s->converted.vaddr,
+                                 (void *)s->dmaBufferVirt);
 }
 
 int hdaStopOutput(struct hda_state *s) {

@@ -5,10 +5,11 @@
 #import "IntelHDAMSIPCI.h"
 #import "IntelHDAMSIWork.h"
 #import "IntelHDAStats.h"
+#import "IntelHDARefillCore.h"
 
 #define DRV_TITLE     "IntelHDA"
-#define DRV_VERSION   "v0.18"
-#define DRV_MILESTONE "pcimsi-032-acknowledged"
+#define DRV_VERSION   "v0.19"
+#define DRV_MILESTONE "rate-conversion-r19"
 
 #ifndef HDA_VERBOSE_LOGS
 #define HDA_VERBOSE_LOGS 0
@@ -38,6 +39,8 @@
     unsigned _msiNotifications, _msiEpochFailures, _ignoredMessages;
     unsigned _completedPeriods, _streamErrors, _pollTicks, _pollCompletions;
     unsigned _lastServiceEndTick, _lastServiceTailTicks, _lastRefillTicks;
+    unsigned _queueResynchronizations, _maxPeriodBatch, _maxRefillTicks;
+    unsigned _lastQueueDepth;
     ns_time_t _completionTimestamp;
     unsigned _msiDisableFailures, _msiReleaseFailures;
     BOOL _msiPromptRequested, _msiPromptActive;

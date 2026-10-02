@@ -40,12 +40,18 @@ RELOC_SOURCES = IntelHDA_reloc.tproj/IntelHDAController.m \
 	IntelHDA_reloc.tproj/IntelHDAMSIWork.c \
 	IntelHDA_reloc.tproj/IntelHDAInterruptCore.c \
 	IntelHDA_reloc.tproj/IntelHDAPlaybackCore.c \
+	IntelHDA_reloc.tproj/IntelHDARefillCore.c \
+	IntelHDA_reloc.tproj/IntelHDACodecCore.c \
+	IntelHDA_reloc.tproj/IntelHDARateCore.c \
 	IntelHDA_reloc.tproj/IntelHDAController.h \
 	IntelHDA_reloc.tproj/IntelHDADriver.h \
 	IntelHDA_reloc.tproj/IntelHDAMSIPCI.h \
 	IntelHDA_reloc.tproj/IntelHDAMSIWork.h \
 	IntelHDA_reloc.tproj/IntelHDAInterruptCore.h \
 	IntelHDA_reloc.tproj/IntelHDAPlaybackCore.h \
+	IntelHDA_reloc.tproj/IntelHDARefillCore.h \
+	IntelHDA_reloc.tproj/IntelHDACodecCore.h \
+	IntelHDA_reloc.tproj/IntelHDARateCore.h \
 	IntelHDA_reloc.tproj/IntelHDAStats.h \
 	IntelHDA_reloc.tproj/PCIMSI/PCIMSIClient.h \
 	IntelHDA_reloc.tproj/PCIMSI/PCIMSICore.h \
