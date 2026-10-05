@@ -10,11 +10,11 @@ LANGUAGE = English
 CLASSES = IntelHDAController.m IntelHDADriver.m
 
 CFILES = IntelHDAMSIPCI.c IntelHDAMSIWork.c IntelHDAInterruptCore.c \
-         IntelHDAPlaybackCore.c IntelHDARefillCore.c IntelHDACodecCore.c IntelHDARateCore.c
+         IntelHDAPlaybackCore.c IntelHDARefillCore.c IntelHDACodecCore.c IntelHDARateCore.c IntelHDARouteCore.c
 
 HFILES = IntelHDAController.h IntelHDADriver.h IntelHDAMSIPCI.h \
          IntelHDAMSIWork.h IntelHDAInterruptCore.h IntelHDAPlaybackCore.h \
-         IntelHDARefillCore.h IntelHDACodecCore.h IntelHDARateCore.h IntelHDAStats.h PCIMSI/PCIMSIClient.h PCIMSI/PCIMSICore.h
+         IntelHDARefillCore.h IntelHDACodecCore.h IntelHDARateCore.h IntelHDARouteCore.h IntelHDARouteStatus.h IntelHDAStats.h PCIMSI/PCIMSIClient.h PCIMSI/PCIMSICore.h
 
 OTHERSRCS = Makefile.preamble Makefile Makefile.postamble\
             Load_Commands.sect Makefile.driver_preamble

@@ -6,10 +6,10 @@
 #import "IntelHDAMSIWork.h"
 #import "IntelHDAStats.h"
 #import "IntelHDARefillCore.h"
+#import "IntelHDARouteStatus.h"
 
 #define DRV_TITLE     "IntelHDA"
-#define DRV_VERSION   "v0.19"
-#define DRV_MILESTONE "rate-conversion-r19"
+#define DRV_VERSION   "v0.20"
 
 #ifndef HDA_VERBOSE_LOGS
 #define HDA_VERBOSE_LOGS 0
@@ -26,7 +26,7 @@
     NXLock *_stateLock;
     port_t _interruptPortKern;
     void *_workerThread;
-    volatile unsigned _workerRunning, _workerExited, _pollMessagePending;
+    volatile unsigned _workerRunning, _workerExited, _pollMessagePending, _routeIdleMessagePending;
     BOOL _initializing, _ready, _ioAudioMayBeLive, _pciConfigured;
     BOOL _msiRequested, _quarantined;
     volatile BOOL _stopping;

@@ -1,3 +1,4 @@
 LOCALMAKEFILEDIR = /LocalDeveloper/Makefiles/driverkit
 LOCALMAKEFILE = Makefile.local_preamble
+OTHER_GARBAGE = intelhda-status intelhda-status.o intelhda-route intelhda-route.o
 -include $(LOCALMAKEFILEDIR)/$(LOCALMAKEFILE)

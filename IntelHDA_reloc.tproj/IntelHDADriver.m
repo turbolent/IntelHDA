@@ -59,6 +59,7 @@ static void restoreRawInterrupts(unsigned flags) {
 - (void)_interruptOccurred;
 - (void)_stopDMAForChannel:channel;
 - (void)_dataPendingForChannel:channel;
+- (void)_dataPendingOccurred:channel;
 @end
 @interface Object (IntelHDAAudioChannelPrivate)
 - (void)setDMASize:(unsigned)size;
@@ -256,8 +257,8 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
     gHDA->firmwareInterruptLine = pci.InterruptLine;
     gHDA->mmioPhys = PCI_BASE_MEMORY(bar0);
     gHDA->mmioSize = HDA_MMIO_SIZE;
-    IOLog("%s %s milestone %s: PCI %04x:%04x SVID %04x SID %04x rev %02x class %06x\n",
-          DRV_TITLE, DRV_VERSION, DRV_MILESTONE, gHDA->vendor, gHDA->device,
+    IOLog("%s %s: PCI %04x:%04x SVID %04x SID %04x rev %02x class %06x\n",
+          DRV_TITLE, DRV_VERSION, gHDA->vendor, gHDA->device,
           gHDA->subsystemVendor, gHDA->subsystemDevice, gHDA->rev, classCode);
     IOLog("%s: MMIO BAR0 0x%08x; firmware InterruptLine %u is informational\n",
           DRV_TITLE, gHDA->mmioPhys, gHDA->firmwareInterruptLine);
@@ -304,14 +305,15 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
             IOLog("%s: MSI initialization failed; no Polling fallback\n", DRV_TITLE);
             [self free]; return nil;
         }
-    } else {
-        _interruptPortKern = IOConvertPort([self interruptPort], IO_KernelIOTask, IO_Kernel);
-        if (_interruptPortKern == PORT_NULL) { [self free]; return nil; }
-        _workerRunning = 1;
-        _workerThread = IOForkThread(hdaInterruptWorker, self);
-        if (!_workerThread) { _workerRunning = 0; [self free]; return nil; }
-        IOLog("%s: explicit 4 ms Polling, no PCIMSI allocation\n", DRV_TITLE);
     }
+    /* Idle route sensing uses the same IOAudio receive thread in both modes.
+     * MSI playback is never serviced by this timer. */
+    _interruptPortKern = IOConvertPort([self interruptPort], IO_KernelIOTask, IO_Kernel);
+    if (_interruptPortKern == PORT_NULL) { [self free]; return nil; }
+    _workerRunning = 1;
+    _workerThread = IOForkThread(hdaInterruptWorker, self);
+    if (!_workerThread) { _workerRunning = 0; [self free]; return nil; }
+    if (!_msiRequested) IOLog("%s: explicit 4 ms Polling, no PCIMSI allocation\n", DRV_TITLE);
     _initializing = NO;
     _ready = YES;
     attachedController = YES;
@@ -596,6 +598,10 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
         return 0;
     [_stateLock lock];
     _lastRefillTicks = hdaWallClock(gHDA) - refillTick;
+    if (!_stopping && hdaPollOutputRoute(gHDA) == HDA_ROUTE_UNSAFE) {
+        [_stateLock unlock];
+        return 0;
+    }
     if (!_stopping) hdaSetOutputInterrupts(gHDA, _msiRequested && _msiActive);
     ok = !_stopping;
     _lastServiceEndTick = hdaWallClock(gHDA);
@@ -655,7 +661,7 @@ static BOOL enablePCHSnoop(id deviceDescription, unsigned deviceID) {
 
 - (void)_interruptOccurred {
     int result;
-    if (!_msiRequested) (void)atomicExchangeUnsigned(&_pollMessagePending, 0);
+    (void)atomicExchangeUnsigned(&_pollMessagePending, 0);
     if (_initializing || !_ready || _stopping) { _ignoredMessages++; return; }
     if (_msiRequested) {
         if (!_msiActive || !_msiAllocated) { _ignoredMessages++; return; }
@@ -953,15 +959,46 @@ done:
     return ok;
 }
 
+- (void)_dataPendingOccurred:channel {
+    int result = HDA_ROUTE_COMMITTED;
+    if (channel == [self _outputChannel])
+        (void)atomicExchangeUnsigned(&_routeIdleMessagePending, 0);
+    /* Preserve IOAudio's usual data-pending behavior. A timer arriving after
+     * playback started must not poll DMA or touch the MSI acknowledgement. */
+    [super _dataPendingOccurred:channel];
+    [_stateLock lock];
+    if (_ready && !_stopping && gHDA && !gHDA->running)
+        result = hdaPollOutputRoute(gHDA);
+    [_stateLock unlock];
+    if (result == HDA_ROUTE_UNSAFE)
+        [self _containPlayback:"route rollback/readback failed"];
+}
+
 - (void)runInterruptWorker {
     msg_header_t message;
+    unsigned idleTicks = 0;
+    volatile unsigned *pending;
+    BOOL running, ready;
     while (_workerRunning) {
-        if (!_stopping && gHDA && gHDA->running &&
-            !atomicExchangeUnsigned(&_pollMessagePending, 1)) {
-            message = hdaInterruptMessageTemplate;
-            message.msg_remote_port = _interruptPortKern;
-            if (msg_send_from_kernel(&message, SEND_TIMEOUT, 0) != SEND_SUCCESS)
-                (void)atomicExchangeUnsigned(&_pollMessagePending, 0);
+        ++idleTicks;
+        [_stateLock lock];
+        ready = _ready && !_stopping && gHDA;
+        running = ready && gHDA->running;
+        [_stateLock unlock];
+        if (ready && ((!_msiRequested && running) ||
+                      (!running && idleTicks >= 63U))) {
+            pending = running ? &_pollMessagePending : &_routeIdleMessagePending;
+            if (!atomicExchangeUnsigned(pending, 1)) {
+                idleTicks = 0;
+                message = hdaInterruptMessageTemplate;
+                /* OPENSTEP IOAudio receive loop at 0x1b5d68 dispatches 900
+                 * to _dataPendingOccurred: with its output channel. Unlike
+                 * an interrupt message, this never acknowledges PCIMSI. */
+                if (!running) message.msg_id = 900;
+                message.msg_remote_port = _interruptPortKern;
+                if (msg_send_from_kernel(&message, SEND_TIMEOUT, 0) != SEND_SUCCESS)
+                    (void)atomicExchangeUnsigned(pending, 0);
+            }
         }
         IOSleep(HDA_WORKER_MS);
     }
@@ -972,9 +1009,83 @@ static void hdaInterruptWorker(void *argument) {
     [(IntelHDADriver *)argument runInterruptWorker];
 }
 
+- (IOReturn)setIntValues:(unsigned *)values
+            forParameter:(IOParameterName)parameterName count:(unsigned)count {
+    int ok;
+    if (strcmp(parameterName, INTEL_HDA_ROUTE_PARAMETER))
+        return [super setIntValues:values forParameter:parameterName count:count];
+    if (count != 1) return IO_R_INVALID_ARG;
+    [_stateLock lock];
+    ok = _ready && !_stopping && !_quarantined &&
+         hdaRequestOutputRoute(gHDA, values[0]);
+    [_stateLock unlock];
+    return ok ? IO_R_SUCCESS : IO_R_INVALID_ARG;
+}
+
+- (IOReturn)_getOutputRoutes:(unsigned *)values count:(unsigned *)count {
+    unsigned i, j, n, volume;
+    struct hda_route *r;
+    [_stateLock lock];
+    if (!gHDA || !gHDA->initialized) { [_stateLock unlock]; return IO_R_NOT_READY; }
+    n = HDA_ROUTE_HEADER + gHDA->routeCount * HDA_ROUTE_ROW;
+    if (*count < n) { *count = n; [_stateLock unlock]; return IO_R_INVALID_ARG; }
+    bzero(values, n * sizeof(*values));
+    values[HDA_RS_SCHEMA] = INTEL_HDA_ROUTE_SCHEMA;
+    values[HDA_RS_COUNT] = gHDA->routeCount;
+    values[HDA_RS_REQUESTED_PIN] = gHDA->requestedPin;
+    values[HDA_RS_APPLIED_PIN] = gHDA->appliedPin;
+    values[HDA_RS_ACTIVE_PIN] = gHDA->pin;
+    values[HDA_RS_REQUEST] = gHDA->routeRequest;
+    values[HDA_RS_COMPLETED] = gHDA->routeCompleted;
+    values[HDA_RS_RESULT] = gHDA->routeLastResult;
+    values[HDA_RS_CHANGES] = gHDA->routeChanges;
+    values[HDA_RS_FAILURES] = gHDA->routeFailures;
+    values[HDA_RS_ROLLBACKS] = gHDA->routeRollbacks;
+    values[HDA_RS_UNSAFE] = gHDA->routeUnsafe;
+    values[HDA_RS_READ_OK] = gHDA->routeReadOK;
+    values[HDA_RS_READ_TICK] = gHDA->routeReadTick;
+    values[HDA_RS_SENSE_ERRORS] = gHDA->routeSenseErrors;
+    values[HDA_RS_MUTE] = gHDA->outputMute;
+    values[HDA_RS_LEFT] = gHDA->outputLeft;
+    values[HDA_RS_RIGHT] = gHDA->outputRight;
+    values[HDA_RS_FORMAT] = gHDA->streamFormat;
+    values[HDA_RS_RUNNING] = gHDA->running;
+    for (i = 0; i < gHDA->routeCount; i++) {
+        unsigned *row = &values[HDA_ROUTE_HEADER + i * HDA_ROUTE_ROW];
+        r = &gHDA->routes[i];
+        row[HDA_RR_PIN] = r->choice.pin; row[HDA_RR_DAC] = r->dac;
+        row[HDA_RR_DEVICE] = r->choice.device; row[HDA_RR_DETECTABLE] = r->choice.detectable;
+        row[HDA_RR_PRESENT] = r->choice.present; row[HDA_RR_SENSE] = r->sense;
+        row[HDA_RR_CONTROL] = r->pinControl; row[HDA_RR_FORMAT] = r->dacFormat;
+        row[HDA_RR_CHANNEL] = r->dacChannel; row[HDA_RR_EAPD] = r->eapd;
+        row[HDA_RR_AMP_LEFT] = r->ampLeft; row[HDA_RR_AMP_RIGHT] = r->ampRight;
+        row[HDA_RR_RATES] = r->rates;
+        volume = 0;
+        for (j = r->length; j > 0; j--) {
+            if ((r->caps[j-1] & 4U) && (r->amps[j-1] & 0x7f00U)) {
+                volume = r->path[j-1];
+                row[HDA_RR_VOLUME_CAPS] = r->amps[j-1]; break;
+            }
+        }
+        row[HDA_RR_VOLUME_NID] = volume;
+        for (j = r->length; j > 0; j--) {
+            if ((r->caps[j-1] & 4U) && (r->amps[j-1] & 0x80000000U)) {
+                row[HDA_RR_MUTE_NID] = r->path[j-1]; break;
+            }
+        }
+        row[HDA_RR_MUTE_LEFT] = r->muteLeft;
+        row[HDA_RR_MUTE_RIGHT] = r->muteRight;
+    }
+    *count = n;
+    [_stateLock unlock];
+    return IO_R_SUCCESS;
+}
+
 - (IOReturn)getIntValues:(unsigned *)values
             forParameter:(IOParameterName)parameterName count:(unsigned *)count {
     unsigned long pciValue;
+    if (!strcmp(parameterName, INTEL_HDA_ROUTES_PARAMETER))
+        return [self _getOutputRoutes:values count:count];
     if (strcmp(parameterName, INTEL_HDA_STATS_PARAMETER))
         return [super getIntValues:values forParameter:parameterName count:count];
     if (*count < INTEL_HDA_STATS_COUNT) { *count = INTEL_HDA_STATS_COUNT; return IO_R_INVALID_ARG; }

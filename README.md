@@ -1,7 +1,7 @@
 # IntelHDA for OPENSTEP
 
 IntelHDA is an OPENSTEP 4.2 driver for Intel High Definition Audio controllers.
-It provides analog playback through one codec and output path, supporting
+It provides analog playback through one codec and one active output path, supporting
 16-bit PCM mono/stereo. The driver probes 8, 16, 22.05, 32, 44.1 and 48 kHz
 while stopped and verifies the selected codec's format register. If the codec
 supports 44.1 kHz but not 22.05 kHz, the driver converts 22.05 kHz playback to
@@ -66,3 +66,18 @@ To check the loaded driver, selected output and interrupt status, run:
 ```sh
 /private/Drivers/i386/IntelHDA.config/intelhda-status
 ```
+
+## Output selection
+
+Version 0.20 switches automatically between connected headphones, line-out
+and the speaker. To inspect outputs or select one manually:
+
+```sh
+/private/Drivers/i386/IntelHDA.config/intelhda-route
+/private/Drivers/i386/IntelHDA.config/intelhda-route auto
+/private/Drivers/i386/IntelHDA.config/intelhda-route 0x21
+```
+
+Use a pin reported by the tool; `0x21` is an example. Changes take effect live,
+preserving volume, mute and playback format. Manual selection lasts until
+`auto` or reboot.

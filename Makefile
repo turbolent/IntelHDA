@@ -9,11 +9,12 @@ LANGUAGE = English
 
 LOCAL_RESOURCES = Localizable.strings
 
-GLOBAL_RESOURCES = Default.table IntelHDA_reloc intelhda-status
+GLOBAL_RESOURCES = Default.table IntelHDA_reloc intelhda-status intelhda-route
 
 CFILES = IntelHDA_bundle_stub.c
 
-OTHERSRCS = Makefile.preamble Makefile Makefile.postamble
+OTHERSRCS = Makefile.preamble Makefile Makefile.postamble \
+	tools/intelhda-status.m tools/intelhda-route.m
 
 MAKEFILEDIR = /NextDeveloper/Makefiles/app
 MAKEFILE = bundle.make
@@ -29,12 +30,10 @@ include $(MAKEFILEDIR)/$(MAKEFILE)
 
 -include Makefile.dependencies
 
-intelhda-status: tools/intelhda-status.m \
-		IntelHDA_reloc.tproj/IntelHDAStats.h
-	$(CC) -O2 -Wall -ObjC -IIntelHDA_reloc.tproj \
-		-o $@ tools/intelhda-status.m -lDriver
-
-RELOC_SOURCES = IntelHDA_reloc.tproj/IntelHDAController.m \
+RELOC_SOURCES = IntelHDA_reloc.tproj/IntelHDARouteCore.c \
+	IntelHDA_reloc.tproj/IntelHDARouteCore.h \
+	IntelHDA_reloc.tproj/IntelHDARouteStatus.h \
+	 IntelHDA_reloc.tproj/IntelHDAController.m \
 	IntelHDA_reloc.tproj/IntelHDADriver.m \
 	IntelHDA_reloc.tproj/IntelHDAMSIPCI.c \
 	IntelHDA_reloc.tproj/IntelHDAMSIWork.c \

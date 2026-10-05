@@ -5,6 +5,7 @@
 #import "IntelHDAInterruptCore.h"
 #import "IntelHDAPlaybackCore.h"
 #import "IntelHDARateCore.h"
+#import "IntelHDARouteCore.h"
 
 #define HDA_BDL_ENTRIES 32
 #define HDA_DMA_ALIGN   128
@@ -26,6 +27,14 @@ struct hda_bdl_entry {
     unsigned int addrHigh;
     unsigned int length;
     unsigned int flags;
+};
+
+struct hda_route {
+    IntelHDARouteChoice choice;
+    unsigned dac, pinCaps, defcfg, length, path[8], select[8], caps[8], amps[8];
+    unsigned pcmCaps, streamCaps, rates;
+    unsigned sense, pinControl, dacFormat, dacChannel, eapd, ampLeft, ampRight;
+    unsigned muteLeft, muteRight, senseTriggered;
 };
 
 struct hda_state {
@@ -71,6 +80,18 @@ struct hda_state {
     unsigned int verifiedRateMask;
     unsigned int pcmCaps;
     unsigned int streamCaps;
+    struct hda_route routes[HDA_ROUTE_MAX];
+    IntelHDARouteChoice choices[HDA_ROUTE_MAX];
+    IntelHDARouteWrite routeWrites[HDA_ROUTE_WRITES];
+    IntelHDARouteDebounce routeDebounce;
+    unsigned routeCount, activeRoute, requestedPin, appliedPin;
+    unsigned routeRequest, routeCompleted, routeChanges, routeFailures;
+    unsigned routeRollbacks, routeUnsafe, routePollTick, routeReadTick;
+    unsigned routeReadOK, routeSenseErrors, routeLastResult, routeBlockedChoice;
+    unsigned routeSavedControl, routeSavedIntctl, routePauseTick;
+    BOOL routeWasRunning, codecDesynchronized;
+    BOOL outputMute;
+    int outputLeft, outputRight;
 
     unsigned int dmaBufferPhys;
     unsigned int dmaBufferVirt;
@@ -108,6 +129,9 @@ int hdaServiceOutput(struct hda_state *s,
                      IntelHDAInterruptResult *result);
 void hdaSetOutputVolume(struct hda_state *s, BOOL mute, int leftAttenuation,
                         int rightAttenuation);
+/* Called only on IOAudio's service thread, with the state lock held. */
+int hdaPollOutputRoute(struct hda_state *s);
+int hdaRequestOutputRoute(struct hda_state *s, unsigned pin);
 unsigned int hdaFormatForParams(unsigned int rate, unsigned int bits,
                                 unsigned int channels);
 int hdaRateIsSupported(struct hda_state *s, unsigned int rate);

@@ -268,6 +268,7 @@ static int hdaCodecCommand(struct hda_state *s, unsigned int nid,
     unsigned int cmd;
     int i;
 
+    if (s->codecDesynchronized) return -1;
     corb = (volatile unsigned int *)s->corb.vaddr;
     rirb = (volatile unsigned int *)s->rirb.vaddr;
     nextWp = (s->corbWp + 1) & (s->corbEntries - 1);
@@ -293,6 +294,10 @@ static int hdaCodecCommand(struct hda_state *s, unsigned int nid,
         wp = hdaRead16(s, HDA_REG_RIRBWP) & (s->rirbEntries - 1);
         if (wp != s->rirbRp) {
             s->rirbRp = (s->rirbRp + 1) & (s->rirbEntries - 1);
+            if ((rirb[s->rirbRp * 2 + 1] & 0x1fU) != s->codecAddress) {
+                hdaWrite8(s, HDA_REG_RIRBSTS, 0x05);
+                continue;
+            }
             if (response != NULL)
                 *response = rirb[s->rirbRp * 2];
             hdaWrite8(s, HDA_REG_RIRBSTS, 0x05);
@@ -301,6 +306,7 @@ static int hdaCodecCommand(struct hda_state *s, unsigned int nid,
         IODelay(10);
     }
 
+    s->codecDesynchronized = YES;
     IOLog("%s: RIRB timeout nid 0x%x verb 0x%x payload 0x%x cmd 0x%08x\n",
           DRV_TITLE, nid, verb, payload, cmd);
     return -1;
@@ -332,7 +338,7 @@ static unsigned int hdaConnEntry(struct hda_state *s, unsigned int nid,
     unsigned int resp;
     unsigned int payload;
 
-    payload = longForm ? (index >> 1) : (index >> 2);
+    payload = longForm ? (index & ~1U) : (index & ~3U);
     if (hdaCodecCommand(s, nid, HDA_VERB_GET_CONN_ENTRY, payload, &resp))
         return 0;
 
@@ -343,39 +349,30 @@ static unsigned int hdaConnEntry(struct hda_state *s, unsigned int nid,
 
 static int hdaFindPath(struct hda_state *s, unsigned int nid,
                        unsigned int target, unsigned int depth) {
-    unsigned int caps;
-    unsigned int len;
-    unsigned int child;
-    unsigned int i;
+    unsigned caps, len, entry, child, previous = 0, index = 0, i, k, range;
     int longForm;
-    int found;
-
-    if (depth >= 8)
-        return 0;
-
+    if (depth >= 8 || nid > 0x7f) return 0;
+    for (i = 0; i < depth; i++) if (s->path[i] == nid) return 0;
     s->path[depth] = nid;
-    if (nid == target) {
-        s->pathLength = depth + 1;
-        return 1;
-    }
-
-    if (hdaGetParam(s, nid, HDA_PARAM_AUDIO_WIDGET_CAPS, &caps))
-        return 0;
-    if ((caps & HDA_AWCAP_CONN_LIST) == 0)
-        return 0;
-
+    if (nid == target) { s->pathLength = depth + 1; return 1; }
+    if (hdaGetParam(s, nid, HDA_PARAM_AUDIO_WIDGET_CAPS, &caps) ||
+        !(caps & HDA_AWCAP_CONN_LIST)) return 0;
     len = hdaConnLength(s, nid, &longForm);
+    range = longForm ? 0x8000U : 0x80U;
     for (i = 0; i < len; i++) {
-        child = hdaConnEntry(s, nid, i, longForm);
-        if (child == 0)
-            continue;
-        found = hdaFindPath(s, child, target, depth + 1);
-        if (found) {
-            s->pathSelect[depth] = i;
-            return 1;
+        entry = hdaConnEntry(s, nid, i, longForm);
+        child = entry & (range - 1);
+        if (!child || child > 0x7f || ((entry & range) && (!previous || child <= previous))) return 0;
+        k = entry & range ? previous + 1 : child;
+        for (; k <= child; k++, index++) {
+            if (index > 255) return 0;
+            if (hdaFindPath(s, k, target, depth + 1)) {
+                s->pathSelect[depth] = index;
+                return 1;
+            }
         }
+        previous = child;
     }
-
     return 0;
 }
 
@@ -504,6 +501,9 @@ void hdaSetOutputVolume(struct hda_state *s, BOOL mute, int leftAttenuation,
 
     if (s == NULL || !s->initialized)
         return;
+    s->outputMute = mute;
+    s->outputLeft = leftAttenuation;
+    s->outputRight = rightAttenuation;
 
     volumeNid = 0;
     muteNid = 0;
@@ -669,151 +669,97 @@ static int hdaAnalogOutputPinInfo(struct hda_state *s, unsigned int nid,
     return 1;
 }
 
+static int hdaQuerySelectedPCM(struct hda_state *s);
+static int hdaProbeOutputRates(struct hda_state *s);
+static int hdaVerifySetting(struct hda_state *s, unsigned nid,
+    unsigned setVerb, unsigned value, unsigned getVerb, unsigned mask);
+
+static void hdaSelectRoute(struct hda_state *s, unsigned index) {
+    struct hda_route *r = &s->routes[index];
+    s->activeRoute = index;
+    s->pin = r->choice.pin; s->dac = r->dac; s->pathLength = r->length;
+    bcopy(r->path, s->path, sizeof(s->path));
+    bcopy(r->select, s->pathSelect, sizeof(s->pathSelect));
+}
+
 static int hdaSetupPath(struct hda_state *s) {
-    unsigned int rootNodes;
-    unsigned int fgStart;
-    unsigned int fgCount;
-    unsigned int fg;
-    unsigned int ftype;
-    unsigned int subNodes;
-    unsigned int nodeStart;
-    unsigned int nodeCount;
-    unsigned int nid;
-    unsigned int caps;
-    unsigned int dacList[32];
-    unsigned int pinList[32];
-    unsigned int pinRank[32];
-    unsigned int pinDefcfg[32];
-    unsigned int dacCount;
-    unsigned int pinCount;
-    unsigned int i;
-    unsigned int j;
-
-    if (hdaGetParam(s, 0, HDA_PARAM_VENDOR_ID, &s->codecVendor)) {
-        IOLog("%s: no codec response at address %d\n", DRV_TITLE,
-              s->codecAddress);
-        return -1;
-    }
-
-    IOLog("%s: codec%d vendor 0x%08x\n", DRV_TITLE, s->codecAddress,
-          s->codecVendor);
-
-    if (hdaGetParam(s, 0, HDA_PARAM_SUB_NODE_COUNT, &rootNodes))
-        return -1;
-    fgStart = (rootNodes >> 16) & 0xff;
-    fgCount = rootNodes & 0xff;
+    unsigned nodes, start, count, i, j, k, caps, type, rank, cfg, pinCaps;
+    unsigned dacs[32], dacCount = 0, selected, common = ~0U;
+    struct hda_route *r;
+    if (hdaGetParam(s, 0, HDA_PARAM_VENDOR_ID, &s->codecVendor) ||
+        hdaGetParam(s, 0, HDA_PARAM_SUB_NODE_COUNT, &nodes)) return -1;
     s->afg = 0;
-
-    for (i = 0; i < fgCount; i++) {
-        fg = fgStart + i;
-        if (hdaGetParam(s, fg, HDA_PARAM_FUNCTION_TYPE, &ftype))
-            continue;
-        if ((ftype & 0xff) == 1) {
-            s->afg = fg;
-            break;
-        }
+    start = (nodes >> 16) & 0xff; count = nodes & 0xff;
+    for (i = 0; i < count; i++) {
+        if (!hdaGetParam(s, start + i, HDA_PARAM_FUNCTION_TYPE, &type) &&
+            (type & 0xff) == 1) { s->afg = start + i; break; }
     }
-
-    if (s->afg == 0) {
-        IOLog("%s: no audio function group found\n", DRV_TITLE);
-        return -1;
-    }
-
-    if (hdaGetParam(s, s->afg, HDA_PARAM_SUB_NODE_COUNT, &subNodes))
-        return -1;
-    nodeStart = (subNodes >> 16) & 0xff;
-    nodeCount = subNodes & 0xff;
-    dacCount = 0;
-    pinCount = 0;
-
-    IOLog("%s: AFG nid 0x%x nodes start 0x%x count %d\n", DRV_TITLE, s->afg,
-          nodeStart, nodeCount);
-
-    for (i = 0; i < nodeCount; i++) {
-        nid = nodeStart + i;
-        if (hdaGetParam(s, nid, HDA_PARAM_AUDIO_WIDGET_CAPS, &caps))
-            continue;
-
+    if (!s->afg || hdaGetParam(s, s->afg, HDA_PARAM_SUB_NODE_COUNT, &nodes)) return -1;
+    start = (nodes >> 16) & 0xff; count = nodes & 0xff;
+    for (i = start; i < start + count; i++) {
+        if (hdaGetParam(s, i, HDA_PARAM_AUDIO_WIDGET_CAPS, &caps)) return -1;
         if (hdaWidgetType(caps) == HDA_WIDGET_AUDIO_OUTPUT &&
-            (caps & HDA_AWCAP_DIGITAL) == 0 && dacCount < 32) {
-            dacList[dacCount++] = nid;
-            IOLog("%s: candidate DAC nid 0x%x caps 0x%08x\n", DRV_TITLE, nid,
-                  caps);
-        }
-
-        if (pinCount < 32 && hdaAnalogOutputPinInfo(s, nid, &pinRank[pinCount],
-                                                    &pinDefcfg[pinCount])) {
-            (void)hdaCodecCommand(s, nid, HDA_VERB_SET_PIN_CONTROL, 0, NULL);
-            pinList[pinCount++] = nid;
-        }
+            !(caps & HDA_AWCAP_DIGITAL) && dacCount < 32) dacs[dacCount++] = i;
     }
-
-    while (pinCount > 0) {
-        unsigned int bestPin;
-        unsigned int bestDefcfg;
-        unsigned int bestIdx;
-        unsigned int bestRank;
-        unsigned int bestAssoc;
-        unsigned int bestSeq;
-        unsigned int rank;
-        unsigned int assoc;
-        unsigned int seq;
-
-        bestPin = 0;
-        bestDefcfg = 0;
-        bestIdx = 0;
-        bestRank = 0xffffffff;
-        bestAssoc = 0xffffffff;
-        bestSeq = 0xffffffff;
-        for (j = 0; j < pinCount; j++) {
-            rank = pinRank[j];
-            assoc = HDA_DEFCFG_ASSOC(pinDefcfg[j]);
-            seq = HDA_DEFCFG_SEQUENCE(pinDefcfg[j]);
-            if (rank < bestRank || (rank == bestRank && assoc < bestAssoc) ||
-                (rank == bestRank && assoc == bestAssoc && seq < bestSeq)) {
-                bestPin = pinList[j];
-                bestDefcfg = pinDefcfg[j];
-                bestIdx = j;
-                bestRank = rank;
-                bestAssoc = assoc;
-                bestSeq = seq;
-            }
-        }
-        if (bestPin == 0)
-            break;
-
-        for (j = bestIdx; j + 1 < pinCount; j++) {
-            pinList[j] = pinList[j + 1];
-            pinRank[j] = pinRank[j + 1];
-            pinDefcfg[j] = pinDefcfg[j + 1];
-        }
-        pinCount--;
-
+    s->routeCount = 0;
+    for (i = start; i < start + count; i++) {
+        if (!hdaAnalogOutputPinInfo(s, i, &rank, &cfg)) continue;
+        /* Disable every analog output, including one beyond the route limit. */
+        if (!hdaVerifySetting(s, i, HDA_VERB_SET_PIN_CONTROL, 0,
+                             HDA_VERB_GET_PIN_CONTROL, 0xff)) return -1;
+        if (s->routeCount == HDA_ROUTE_MAX) continue;
         for (j = 0; j < dacCount; j++) {
             bzero(s->path, sizeof(s->path));
             bzero(s->pathSelect, sizeof(s->pathSelect));
             s->pathLength = 0;
-            if (hdaFindPath(s, bestPin, dacList[j], 0)) {
-                s->pin = bestPin;
-                s->dac = dacList[j];
-                IOLog("%s: selected output path pin 0x%x (%s rank %d assoc %d "
-                      "seq %d) -> DAC 0x%x length %d\n",
-                      DRV_TITLE, s->pin,
-                      hdaDefaultDeviceName(HDA_DEFCFG_DEVICE(bestDefcfg)),
-                      bestRank, bestAssoc, bestSeq, s->dac, s->pathLength);
-                return 0;
-            }
+            if (hdaFindPath(s, i, dacs[j], 0)) break;
         }
-        IOLog("%s: no DAC path for ranked output pin 0x%x (%s rank %d assoc %d "
-              "seq %d)\n",
-              DRV_TITLE, bestPin,
-              hdaDefaultDeviceName(HDA_DEFCFG_DEVICE(bestDefcfg)), bestRank,
-              bestAssoc, bestSeq);
+        if (j == dacCount) continue;
+        s->pin = i; s->dac = dacs[j];
+        if (hdaQuerySelectedPCM(s) || hdaProbeOutputRates(s)) return -1;
+        if (!(s->pcmCaps & HDA_SUPPCM_BITS_16)) continue;
+        r = &s->routes[s->routeCount];
+        bzero(r, sizeof(*r));
+        if (hdaGetParam(s, i, HDA_PARAM_PIN_CAPS, &pinCaps)) return -1;
+        r->choice.pin = i; r->choice.device = HDA_DEFCFG_DEVICE(cfg);
+        r->choice.association = HDA_DEFCFG_ASSOC(cfg);
+        r->choice.sequence = HDA_DEFCFG_SEQUENCE(cfg);
+        /* Fixed pins and BIOS Jack Detect Override do not have usable sense. */
+        r->choice.detectable = (pinCaps & HDA_PINCAP_PRESENCE) &&
+            !(cfg & 0x100U) && HDA_DEFCFG_PORT_CONN(cfg) != 2U;
+        r->choice.present = -1;
+        if (r->choice.detectable) {
+            if (hdaCodecCommand(s, i, HDA_VERB_GET_PIN_SENSE, 0, &r->sense)) return -1;
+            r->choice.present = r->sense == ~0U ? -1 : !!(r->sense & HDA_PIN_SENSE_PRESENCE);
+        }
+        r->dac = s->dac; r->pinCaps = pinCaps; r->defcfg = cfg;
+        r->length = s->pathLength;
+        bcopy(s->path, r->path, sizeof(r->path));
+        bcopy(s->pathSelect, r->select, sizeof(r->select));
+        for (k = 0; k < r->length; k++) {
+            if (hdaGetParam(s, r->path[k], HDA_PARAM_AUDIO_WIDGET_CAPS, &r->caps[k])) return -1;
+            if (r->caps[k] & HDA_AWCAP_OUT_AMP)
+                r->amps[k] = hdaAmpCaps(s, r->path[k], r->caps[k]);
+        }
+        r->pcmCaps = s->pcmCaps; r->streamCaps = s->streamCaps;
+        r->rates = s->verifiedRateMask;
+        common &= r->rates;
+        s->choices[s->routeCount++] = r->choice;
+        IOLog("%s: route pin 0x%x DAC 0x%x device %s sense %d rates 0x%x\n",
+            DRV_TITLE, i, r->dac, hdaDefaultDeviceName(r->choice.device),
+            r->choice.present, r->rates);
     }
-
-    IOLog("%s: no analog pin-to-DAC path found (pins %d dacs %d)\n", DRV_TITLE,
-          pinCount, dacCount);
-    return -1;
+    if (!s->routeCount || !common) return -1;
+    selected = IntelHDARouteChoose(s->choices, s->routeCount, 0);
+    /* An unplugged-only machine still needs an initial converter. */
+    if (selected == s->routeCount) selected = 0;
+    hdaSelectRoute(s, selected);
+    s->pcmCaps = s->routes[selected].pcmCaps;
+    s->streamCaps = s->routes[selected].streamCaps;
+    s->verifiedRateMask = common;
+    IOLog("%s: selected pin 0x%x DAC 0x%x; common verified rates 0x%x\n",
+        DRV_TITLE, s->pin, s->dac, common);
+    return 0;
 }
 
 static int hdaQuerySelectedPCM(struct hda_state *s) {
@@ -930,6 +876,221 @@ static int hdaProgramPath(struct hda_state *s, unsigned int format) {
 failed:
     s->codecSetupFailures++;
     return -1;
+}
+
+/* Route transactions run with the driver's state lock on IOAudio's thread.
+ * Only RUN is paused: never reset the stream, BDL, converter history, LPIB,
+ * queue, MSI allocation or provider gate. BCIS remains pending for service. */
+static int hdaRoutePause(void *context) {
+    struct hda_state *s = context;
+    unsigned i, ctl = hdaReadStreamControl(s, s->outputStreamBase);
+    hdaWriteStreamControl(s, s->outputStreamBase, ctl & ~HDA_SD_CTL_RUN);
+    for (i = 0; i < HDA_POLL_COUNT; i++) {
+        if (!(hdaReadStreamControl(s, s->outputStreamBase) & HDA_SD_CTL_RUN)) {
+            s->routePauseTick = hdaWallClock(s);
+            return 1;
+        }
+        IODelay(10);
+    }
+    return 0;
+}
+static int hdaRouteResume(void *context) {
+    struct hda_state *s = context;
+    unsigned i, tick;
+    hdaWriteStreamControl(s, s->outputStreamBase, s->routeSavedControl);
+    for (i = 0; i < HDA_POLL_COUNT; i++) {
+        if (hdaReadStreamControl(s, s->outputStreamBase) == s->routeSavedControl) {
+            tick = hdaWallClock(s);
+            /* Exclude only stopped wall time; keep unsampled DMA progress. */
+            if (s->routeWasRunning) s->progress.tick += tick - s->routePauseTick;
+            return hdaInterruptControl(s) == s->routeSavedIntctl;
+        }
+        IODelay(10);
+    }
+    return 0;
+}
+static const IntelHDARouteOps hdaRouteOps = {
+    hdaCodecCoreCommand, hdaRoutePause, hdaRouteResume
+};
+static void hdaRouteAdd(struct hda_state *s, unsigned *count, unsigned nid,
+    unsigned set, unsigned get, unsigned getPayload, unsigned prefix,
+    unsigned value, unsigned mask, unsigned preserve) {
+    IntelHDARouteWrite *w = &s->routeWrites[(*count)++];
+    w->nid = nid; w->setVerb = set; w->getVerb = get;
+    w->getPayload = getPayload; w->prefix = prefix; w->value = value;
+    w->mask = mask; w->preserve = preserve;
+}
+static void hdaRouteAmps(struct hda_route *r, unsigned *volume, unsigned *mute) {
+    int i;
+    *volume = *mute = r->length;
+    for (i = (int)r->length - 1; i >= 0; i--) {
+        if (!(r->caps[i] & HDA_AWCAP_OUT_AMP)) continue;
+        if (*volume == r->length && (r->amps[i] & HDA_AMPCAP_NUM_STEPS)) *volume = i;
+        if (*mute == r->length && (r->amps[i] & HDA_AMPCAP_MUTE)) *mute = i;
+    }
+}
+static int hdaSwitchRoute(struct hda_state *s, unsigned target) {
+    struct hda_route *r = &s->routes[target];
+    unsigned n = 0, i, volume, mute, left, right, muted, ctl;
+    int result;
+    if (target == s->activeRoute) return HDA_ROUTE_COMMITTED;
+    hdaRouteAmps(r, &volume, &mute);
+    /* A route must support preserving both controls before touching hardware. */
+    if (volume == r->length || mute == r->length) return HDA_ROUTE_REJECTED;
+    s->routeSavedControl = hdaReadStreamControl(s, s->outputStreamBase);
+    s->routeSavedIntctl = hdaInterruptControl(s);
+    s->routeWasRunning = s->running;
+    if (!!(s->routeSavedControl & HDA_SD_CTL_RUN) != !!s->running)
+        return HDA_ROUTE_UNSAFE;
+    if (s->running && hdaRead16(s, s->outputStreamBase + HDA_SD_FORMAT) != s->streamFormat)
+        return HDA_ROUTE_UNSAFE;
+    hdaRouteAdd(s, &n, s->pin, HDA_VERB_SET_PIN_CONTROL, HDA_VERB_GET_PIN_CONTROL, 0, 0, 0, 0xff, 0);
+    hdaRouteAdd(s, &n, r->choice.pin, HDA_VERB_SET_PIN_CONTROL, HDA_VERB_GET_PIN_CONTROL, 0, 0, 0, 0xff, 0);
+    for (i = 0; i + 1 < r->length; i++) {
+        if (hdaWidgetType(r->caps[i]) == HDA_WIDGET_AUDIO_SELECTOR ||
+            hdaWidgetType(r->caps[i]) == HDA_WIDGET_PIN_COMPLEX)
+            hdaRouteAdd(s, &n, r->path[i], HDA_VERB_SET_CONN_SELECT,
+                HDA_VERB_GET_CONN_SELECT, 0, 0, r->select[i], 0xff, 0);
+    }
+    if (s->dac != r->dac)
+        hdaRouteAdd(s, &n, s->dac, HDA_VERB_SET_STREAM_CHANNEL, HDA_VERB_GET_STREAM_CHANNEL, 0, 0, 0, 0xff, 0);
+    hdaRouteAdd(s, &n, r->dac, HDA_VERB_SET_STREAM_FORMAT, HDA_VERB_GET_STREAM_FORMAT, 0, 0, s->streamFormat, 0xffff, 0);
+    hdaRouteAdd(s, &n, r->dac, HDA_VERB_SET_STREAM_CHANNEL, HDA_VERB_GET_STREAM_CHANNEL, 0, 0, s->streamTag << 4, 0xff, 0);
+    if (r->pinCaps & HDA_PINCAP_EAPD)
+        hdaRouteAdd(s, &n, r->choice.pin, HDA_VERB_SET_EAPD, HDA_VERB_GET_EAPD, 0, 0, 2, 7, 5);
+    for (i = 0; i < r->length; i++) {
+        if (!(r->caps[i] & HDA_AWCAP_OUT_AMP)) continue;
+        left = right = hdaAmpZeroDbGain(r->amps[i]);
+        if (i == volume) {
+            left = hdaAmpGainForAttenuation(r->amps[i], s->outputLeft);
+            right = hdaAmpGainForAttenuation(r->amps[i], s->outputRight);
+        }
+        muted = i == mute && s->outputMute ? 0x80 : 0;
+        hdaRouteAdd(s, &n, r->path[i], HDA_VERB_SET_AMP_GAIN_MUTE, HDA_VERB_GET_AMP_GAIN_MUTE,
+            HDA_AMP_GET_OUTPUT | HDA_AMP_GET_LEFT, HDA_AMP_SET_OUTPUT | HDA_AMP_SET_LEFT, left | muted, 0xff, 0);
+        hdaRouteAdd(s, &n, r->path[i], HDA_VERB_SET_AMP_GAIN_MUTE, HDA_VERB_GET_AMP_GAIN_MUTE,
+            HDA_AMP_GET_OUTPUT | HDA_AMP_GET_RIGHT, HDA_AMP_SET_OUTPUT | HDA_AMP_SET_RIGHT, right | muted, 0xff, 0);
+    }
+    ctl = HDA_PINCTL_OUT_ENABLE;
+    if (r->pinCaps & HDA_PINCAP_HEADPHONE) ctl |= HDA_PINCTL_HP_ENABLE;
+    hdaRouteAdd(s, &n, r->choice.pin, HDA_VERB_SET_PIN_CONTROL, HDA_VERB_GET_PIN_CONTROL, 0, 0, ctl, 0xff, 0);
+    result = IntelHDARouteApply(s, &hdaRouteOps, s->routeWrites, n);
+    if (result == HDA_ROUTE_COMMITTED) {
+        hdaSelectRoute(s, target);
+        s->routeChanges++;
+        IOLog("%s: live route pin 0x%x DAC 0x%x format 0x%x running %u\n",
+            DRV_TITLE, s->pin, s->dac, s->streamFormat, s->running);
+    } else {
+        s->routeFailures++;
+        if (result == HDA_ROUTE_REJECTED) s->routeRollbacks++;
+        IOLog("%s: route pin 0x%x failed (%d); previous pin 0x%x\n",
+            DRV_TITLE, r->choice.pin, result, s->pin);
+    }
+    return result;
+}
+
+int hdaRequestOutputRoute(struct hda_state *s, unsigned pin) {
+    unsigned i;
+    if (!s || !s->initialized || s->routeUnsafe) return 0;
+    i = IntelHDARouteChoose(s->choices, s->routeCount, pin);
+    if (pin && i == s->routeCount) return 0;
+    /* One outstanding request. The status response distinguishes accepted
+     * requests from hardware completion, including failure/rollback. */
+    if (s->routeRequest != s->routeCompleted) return 0;
+    s->requestedPin = pin; s->routeRequest++;
+    s->routeLastResult = 2; s->routeBlockedChoice = 0;
+    return 1;
+}
+static int hdaReadRouteState(struct hda_state *s) {
+    unsigned i, volume, mute;
+    struct hda_route *r;
+    s->routeReadOK = 0;
+    for (i = 0; i < s->routeCount; i++) {
+        r = &s->routes[i];
+        if (hdaCodecCommand(s, r->choice.pin, HDA_VERB_GET_PIN_CONTROL, 0, &r->pinControl) ||
+            hdaCodecCommand(s, r->dac, HDA_VERB_GET_STREAM_FORMAT, 0, &r->dacFormat) ||
+            hdaCodecCommand(s, r->dac, HDA_VERB_GET_STREAM_CHANNEL, 0, &r->dacChannel)) return 0;
+        r->eapd = ~0U;
+        if ((r->pinCaps & HDA_PINCAP_EAPD) &&
+            hdaCodecCommand(s, r->choice.pin, HDA_VERB_GET_EAPD, 0, &r->eapd)) return 0;
+        hdaRouteAmps(r, &volume, &mute);
+        r->ampLeft = r->ampRight = r->muteLeft = r->muteRight = ~0U;
+        if (volume < r->length &&
+            (hdaCodecCommand(s, r->path[volume], HDA_VERB_GET_AMP_GAIN_MUTE,
+                HDA_AMP_GET_OUTPUT | HDA_AMP_GET_LEFT, &r->ampLeft) ||
+             hdaCodecCommand(s, r->path[volume], HDA_VERB_GET_AMP_GAIN_MUTE,
+                HDA_AMP_GET_OUTPUT | HDA_AMP_GET_RIGHT, &r->ampRight))) return 0;
+        if (mute < r->length &&
+            (hdaCodecCommand(s, r->path[mute], HDA_VERB_GET_AMP_GAIN_MUTE,
+                HDA_AMP_GET_OUTPUT | HDA_AMP_GET_LEFT, &r->muteLeft) ||
+             hdaCodecCommand(s, r->path[mute], HDA_VERB_GET_AMP_GAIN_MUTE,
+                HDA_AMP_GET_OUTPUT | HDA_AMP_GET_RIGHT, &r->muteRight))) return 0;
+    }
+    s->routeReadOK = 1; s->routeReadTick = hdaWallClock(s);
+    return 1;
+}
+int hdaPollOutputRoute(struct hda_state *s) {
+    unsigned i, selected, tick;
+    int result = HDA_ROUTE_COMMITTED, request;
+    struct hda_route *r;
+    if (!s || !s->initialized || s->routeUnsafe) return HDA_ROUTE_UNSAFE;
+    tick = hdaWallClock(s);
+    request = s->routeRequest != s->routeCompleted;
+    if (!request && tick - s->routePollTick < 6000000U) return HDA_ROUTE_COMMITTED;
+    s->routePollTick = tick;
+    for (i = 0; i < s->routeCount; i++) {
+        r = &s->routes[i];
+        if (!r->choice.detectable) continue;
+        /* Trigger-required pins need a measurement before GET_PIN_SENSE. */
+        if ((r->pinCaps & 2U) && !r->senseTriggered) {
+            if (hdaCodecCommand(s, r->choice.pin, 0x709, 0, 0)) {
+                s->routeSenseErrors++; result = HDA_ROUTE_UNSAFE; goto done;
+            }
+            r->senseTriggered = 1;
+        }
+        if (hdaCodecCommand(s, r->choice.pin, HDA_VERB_GET_PIN_SENSE, 0, &r->sense)) {
+            s->routeSenseErrors++; s->routeDebounce.samples = 0;
+            r->choice.present = -1; s->choices[i] = r->choice;
+            result = s->codecDesynchronized ? HDA_ROUTE_UNSAFE : HDA_ROUTE_REJECTED;
+            goto done;
+        }
+        /* 0xffffffff means an unfinished impedance measurement, not present. */
+        if (r->sense == ~0U) {
+            s->routeDebounce.samples = 0;
+            r->choice.present = -1; s->choices[i] = r->choice;
+            if (!s->requestedPin) { result = HDA_ROUTE_REJECTED; goto done; }
+            continue;
+        }
+        r->senseTriggered = 0;
+        r->choice.present = !!(r->sense & HDA_PIN_SENSE_PRESENCE);
+        s->choices[i] = r->choice;
+    }
+    selected = IntelHDARouteChoose(s->choices, s->routeCount, s->requestedPin);
+    if (selected == s->routeCount) {
+        /* No connected route: retain the last converter, rather than routing
+         * an absent jack or inventing an endpoint. */
+        s->routeDebounce.samples = 0;
+        result = request ? HDA_ROUTE_REJECTED : HDA_ROUTE_COMMITTED;
+    } else {
+        if (s->routeBlockedChoice != selected + 1) s->routeBlockedChoice = 0;
+        if (request || (!s->routeBlockedChoice && IntelHDARouteStable(&s->routeDebounce, selected))) {
+            result = hdaSwitchRoute(s, selected);
+            if (result == HDA_ROUTE_REJECTED) s->routeBlockedChoice = selected + 1;
+        }
+    }
+    if (result != HDA_ROUTE_UNSAFE && !hdaReadRouteState(s))
+        result = HDA_ROUTE_UNSAFE;
+done:
+    if (request) {
+        if (result == HDA_ROUTE_COMMITTED) s->appliedPin = s->requestedPin;
+        else s->requestedPin = s->appliedPin;
+        s->routeCompleted = s->routeRequest;
+        s->routeLastResult = (unsigned)result;
+    }
+    if (result == HDA_ROUTE_UNSAFE) {
+        s->routeReadOK = 0; s->routeUnsafe = 1; return result;
+    }
+    return result;
 }
 
 static int hdaSetupRings(struct hda_state *s) {
@@ -1156,9 +1317,6 @@ int hdaInitController(struct hda_state *s) {
         return -1;
     if (hdaSetupPath(s))
         return -1;
-    if (hdaQuerySelectedPCM(s))
-        return -1;
-    if (hdaProbeOutputRates(s)) return -1;
 
     if (!hdaRateIsNative(s, 22050) && hdaRateIsNative(s, 44100)) {
         /* The BDL translates every page; this ring needs wired kernel memory,

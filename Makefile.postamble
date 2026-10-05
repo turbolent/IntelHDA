@@ -1,2 +1,11 @@
 -include $(LOCALMAKEFILEDIR)/Makefile.local_postamble
 include /NextDeveloper/Makefiles/driverkit/Makefile.bundle_postamble
+
+intelhda-status: tools/intelhda-status.m \
+		IntelHDA_reloc.tproj/IntelHDAStats.h
+	$(CC) -O2 -Wall -ObjC -IIntelHDA_reloc.tproj \
+		-o $@ tools/intelhda-status.m -lDriver
+
+intelhda-route: tools/intelhda-route.m IntelHDA_reloc.tproj/IntelHDARouteStatus.h
+	$(CC) -O2 -Wall -ObjC -IIntelHDA_reloc.tproj \
+		-o $@ tools/intelhda-route.m -lDriver
